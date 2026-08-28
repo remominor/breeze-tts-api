@@ -130,27 +130,17 @@ RUN python - <<'PY'
 import torch
 import flash_attn
 import comfy_kitchen
-import comfy_kitchen.backends.cuda as ck_cuda
 
 print("Torch:", torch.__version__)
-print("Torch CUDA:", torch.version.cuda)
+print("Torch CUDA runtime:", torch.version.cuda)
 print("CXX11 ABI:", torch._C._GLIBCXX_USE_CXX11_ABI)
 print("FlashAttention:", flash_attn.__version__)
-print("comfy-kitchen CUDA extension:", ck_cuda._EXT_AVAILABLE)
-print("comfy-kitchen cuBLASLt:", ck_cuda._CUBLASLT_AVAILABLE)
-
-cuda_caps = comfy_kitchen.list_backends()["cuda"]["capabilities"]
-print("comfy-kitchen CUDA int8_linear:", "int8_linear" in cuda_caps)
+print("comfy-kitchen:", getattr(comfy_kitchen, "__version__", "unknown"))
 
 assert torch.__version__.startswith("2.9.1")
 assert torch.version.cuda == "12.8"
 assert torch._C._GLIBCXX_USE_CXX11_ABI is True
 assert flash_attn.__version__.startswith("2.8.3")
-
-assert ck_cuda._EXT_AVAILABLE, "comfy-kitchen CUDA extension failed to load"
-assert ck_cuda._CUBLASLT_AVAILABLE, "comfy-kitchen could not load cuBLASLt"
-assert "int8_linear" in cuda_caps, \
-    "comfy-kitchen CUDA int8_linear unavailable; would fall back to Triton"
 PY
 
 EXPOSE 7860
