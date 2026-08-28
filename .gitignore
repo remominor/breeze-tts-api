@@ -1,0 +1,25 @@
+runs/
+outputs/
+warmup_manifest.json
+*.wav
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+.idea/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Model assets are supplied through Docker/Unraid host mappings.
+models/Breeze-TTS-2/
+*.safetensors
+
+# Local editor/agent backups.
+*.bak
+
+.env
+.env.*
+!.env.example

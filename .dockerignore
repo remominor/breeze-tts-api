@@ -1,0 +1,44 @@
+.git
+.env
+.env.*
+!.env.example
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+runs
+outputs
+*.wav
+*.mp3
+*.flac
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+git
+.gitignore
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pcm
+*.wav
+
+# Local model weights - supplied by an Unraid volume.
+models/Breeze-TTS-2/
+Breeze-TTS-2-int8-hybrid.safetensors
+
+# Development/test caches
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.cache
+
+# Local output
+dist/
+build/

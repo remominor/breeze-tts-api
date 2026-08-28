@@ -1,0 +1,48 @@
+services:
+  breeze-tts-api:
+    image: ${BREEZE_IMAGE:-breeze-tts-api:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: breeze-tts-api
+    ports:
+      - "${BREEZE_HOST_PORT:-7860}:7860"
+    volumes:
+      # The model directory is read-only; keep the multi-gigabyte assets out
+      # of the image and point these host paths at your Unraid shares.
+      - "${BREEZE_MODELS_HOST_PATH:-./models}:/models:ro"
+      # Profiles contain ref_audio.wav, meta.json, and cached ref_codes.
+      - "${BREEZE_PROFILES_HOST_PATH:-./voices}:/data/profiles"
+      - "${BREEZE_CACHE_HOST_PATH:-./cache}:/cache"
+    environment:
+      BREEZE_HOST: 0.0.0.0
+      BREEZE_PORT: 7860
+      BREEZE_MODEL_ROOT: /models
+      BREEZE_MODEL_DIR: ${BREEZE_MODEL_DIR:-/models/Breeze-TTS-2}
+      BREEZE_WEIGHTS_FILE: ${BREEZE_WEIGHTS_FILE:-Breeze-TTS-2-int8-hybrid.safetensors}
+      BREEZE_WEIGHTS_PATH: ${BREEZE_WEIGHTS_PATH:-}
+      BREEZE_PROFILE_DIR: /data/profiles
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      HF_HOME: /cache/huggingface
+      TORCHINDUCTOR_CACHE_DIR: /cache/torchinductor
+      TRITON_CACHE_DIR: /cache/triton
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    stop_grace_period: 2m
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/health', timeout=5).read()"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5m
