@@ -27,6 +27,7 @@ RUN apt-get update \
         g++ \
         libsndfile1 \
         python3 \
+        python3-dev \
         python3-pip \
         python3-venv \
         sox \
@@ -63,18 +64,28 @@ RUN grep -vE \
 #
 # FlashAttention 2.8.3
 #
-# IMPORTANT:
-# Use the official prebuilt CPython 3.12 / CUDA 12 / Torch 2.9 /
-# CXX11-ABI=TRUE wheel. Never invoke "pip install flash-attn" here,
-# because that can silently fall back to a source build.
+# Install the known-good prebuilt CPython 3.12 / CUDA 12 / Torch 2.9 /
+# CXX11-ABI=TRUE wheel. Preserve the complete wheel filename because pip
+# uses it to validate Python/platform compatibility.
 #
+ARG FLASH_ATTN_WHEEL="flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ARG FLASH_ATTN_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ARG FLASH_ATTN_SHA256="4e2f9e39313266b1544b68138b15b91ee6221eccf14f7902b7c6620351340810"
 
-RUN curl -fL "${FLASH_ATTN_URL}" -o /tmp/flash_attn.whl \
-    && echo "${FLASH_ATTN_SHA256}  /tmp/flash_attn.whl" | sha256sum -c - \
-    && python -m pip install --no-deps /tmp/flash_attn.whl \
-    && rm /tmp/flash_attn.whl
+RUN curl -fL "${FLASH_ATTN_URL}" -o "/tmp/${FLASH_ATTN_WHEEL}" \
+    && echo "${FLASH_ATTN_SHA256}  /tmp/${FLASH_ATTN_WHEEL}" | sha256sum -c - \
+    && python -m pip install --no-deps "/tmp/${FLASH_ATTN_WHEEL}" \
+    && rm "/tmp/${FLASH_ATTN_WHEEL}"
+
+RUN python - <<'PY'
+import torch
+import flash_attn
+
+print("Torch:", torch.__version__)
+print("CUDA:", torch.version.cuda)
+print("CXX11 ABI:", torch._C._GLIBCXX_USE_CXX11_ABI)
+print("FlashAttention:", flash_attn.__version__)
+PY
 
 #
 # Application
