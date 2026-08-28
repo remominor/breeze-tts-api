@@ -62,6 +62,20 @@ RUN grep -vE \
         comfy-kitchen==0.2.31
 
 #
+# comfy-kitchen 0.2.31 dynamically probes cuBLASLt by looking for
+# libcublasLt.so.13 and then libcublasLt.so.  The CUDA runtime image
+# and PyTorch's nvidia-cublas-cu12 package provide libcublasLt.so.12
+# but may omit the unversioned development symlink.
+#
+# Without this link, comfy-kitchen silently omits its native CUDA
+# int8_linear backend and dispatches Breeze's ConvRot INT8 layers
+# through the much slower Triton fallback.
+#
+RUN ln -sf \
+    /opt/venv/lib/python3.12/site-packages/nvidia/cublas/lib/libcublasLt.so.12 \
+    /usr/local/cuda/lib64/libcublasLt.so
+
+#
 # FlashAttention 2.8.3
 #
 # Install the known-good prebuilt CPython 3.12 / CUDA 12 / Torch 2.9 /
@@ -116,17 +130,27 @@ RUN python - <<'PY'
 import torch
 import flash_attn
 import comfy_kitchen
+import comfy_kitchen.backends.cuda as ck_cuda
 
 print("Torch:", torch.__version__)
 print("Torch CUDA:", torch.version.cuda)
 print("CXX11 ABI:", torch._C._GLIBCXX_USE_CXX11_ABI)
 print("FlashAttention:", flash_attn.__version__)
-print("comfy-kitchen:", getattr(comfy_kitchen, "__version__", "unknown"))
+print("comfy-kitchen CUDA extension:", ck_cuda._EXT_AVAILABLE)
+print("comfy-kitchen cuBLASLt:", ck_cuda._CUBLASLT_AVAILABLE)
+
+cuda_caps = comfy_kitchen.list_backends()["cuda"]["capabilities"]
+print("comfy-kitchen CUDA int8_linear:", "int8_linear" in cuda_caps)
 
 assert torch.__version__.startswith("2.9.1")
 assert torch.version.cuda == "12.8"
 assert torch._C._GLIBCXX_USE_CXX11_ABI is True
 assert flash_attn.__version__.startswith("2.8.3")
+
+assert ck_cuda._EXT_AVAILABLE, "comfy-kitchen CUDA extension failed to load"
+assert ck_cuda._CUBLASLT_AVAILABLE, "comfy-kitchen could not load cuBLASLt"
+assert "int8_linear" in cuda_caps, \
+    "comfy-kitchen CUDA int8_linear unavailable; would fall back to Triton"
 PY
 
 EXPOSE 7860
