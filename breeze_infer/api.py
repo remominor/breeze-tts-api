@@ -586,7 +586,9 @@ async def speech(request: Request):
                             ref_request.get("profile_id"),
                             "ref_audio_codes" in ref_request,
                         )
-                        for chunk in active_runtime.iter_audio_chunks(inputs, request_id=segment_request_id):
+                        for chunk in active_runtime.iter_audio_chunks(
+                            inputs, request_id=segment_request_id, seed=seed
+                        ):
                             item = _pcm16(chunk.audio)
                             if not item:
                                 continue
@@ -655,7 +657,7 @@ async def speech(request: Request):
                 "ref_audio_codes" in ref_request,
             )
             for chunk in active_runtime.iter_audio_chunks(
-                inputs, request_id=f"{request_id}-{segment_index}"
+                inputs, request_id=f"{request_id}-{segment_index}", seed=seed
             ):
                 item = _pcm16(chunk.audio)
                 if item:

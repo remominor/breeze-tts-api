@@ -752,6 +752,7 @@ class FastBreezeStreamingRuntime:
         inputs: dict[str, Any],
         *,
         request_id: str | None = None,
+        seed: int | None = None,
     ) -> Iterator[FastStreamingChunk]:
         cfg = select_fast_cfg(inputs)
         branch_batch_size = 2 if cfg.mode == "single_cfg" else 1
@@ -774,6 +775,12 @@ class FastBreezeStreamingRuntime:
             dtype=torch.long,
             device=self.device,
         )
+        # Lazy graph/cache/codec setup above may consume random numbers on a
+        # first request. Reset at the actual sampling boundary so a request
+        # seed produces the same token stream regardless of warmup state.
+        if seed is not None:
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
         first_decode = True
         t_start = time.perf_counter()
         t_chunk = t_start

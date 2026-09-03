@@ -59,7 +59,7 @@ def _configure_fake_speech_state(monkeypatch, *, runtime_error: bool = False) ->
         fast_enabled = True
         sample_rate = 24_000
 
-        def iter_audio_chunks(self, _inputs, *, request_id):
+        def iter_audio_chunks(self, _inputs, *, request_id, seed=None):
             if runtime_error:
                 raise RuntimeError(f"failed {request_id}")
             yield SimpleNamespace(audio=np.array([0.25, -0.25], dtype=np.float32))

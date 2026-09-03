@@ -14,7 +14,7 @@ def _payload() -> dict:
     return json.loads((REPO_ROOT / "configs" / "fast.json").read_text())
 
 
-def test_bundled_config_covers_cfg4_low_vram_profile() -> None:
+def test_bundled_config_covers_cfg4_low_vram_and_voice_direction_profile() -> None:
     profile = load_warmup_profile(REPO_ROOT / "configs" / "fast.json")
 
     assert profile.cfg_scales == (4.0,)
@@ -31,6 +31,13 @@ def test_bundled_config_covers_cfg4_low_vram_profile() -> None:
         if graph.batch_size == 2
     ]
     assert cfg_guided_text_lengths == list(range(32, 513, 32))
+    voice_direction_text_lengths = [
+        graph.token_length
+        for graph in profile.text_encoder_graphs
+        if graph.batch_size == 4
+    ]
+    # ref_edit_tata merges the two positive and two negative text segments.
+    assert voice_direction_text_lengths == [64, 96, 128]
 
 
 def test_config_requires_decode_graph_for_each_cfg_shape() -> None:
