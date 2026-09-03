@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 
+from breeze_infer.model_download import ensure_hybrid_assets
 from models.breeze import BreezeForConditionalGeneration
 from models.breeze_config import BreezeConfig
 
@@ -156,6 +157,9 @@ def load_runtime(
     attn_implementation: str,
     weights_path: Path | None = None,
 ) -> tuple[AutoTokenizer, BreezeForConditionalGeneration, Any]:
+
+    if weights_path is not None:
+        weights_path = ensure_hybrid_assets(ckpt_dir, weights_path)
 
     if device.startswith("cuda"):
         try:

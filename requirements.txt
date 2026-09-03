@@ -5,6 +5,7 @@ transformers==4.57.3
 numpy>=2.0
 soundfile>=0.13
 fastapi>=0.115
+huggingface_hub>=0.34
 uvicorn>=0.30
 python-multipart>=0.0.18
 pytest>=8.0

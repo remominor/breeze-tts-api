@@ -8,9 +8,9 @@ services:
     ports:
       - "${BREEZE_HOST_PORT:-7860}:7860"
     volumes:
-      # The model directory is read-only; keep the multi-gigabyte assets out
-      # of the image and point these host paths at your Unraid shares.
-      - "${BREEZE_MODELS_HOST_PATH:-./models}:/models:ro"
+      # Model assets are downloaded into this persistent host path on first
+      # use, so it must be writable by the container.
+      - "${BREEZE_MODELS_HOST_PATH:-./models}:/models"
       # Profiles contain ref_audio.wav, meta.json, and cached ref_codes.
       - "${BREEZE_PROFILES_HOST_PATH:-./voices}:/data/profiles"
       - "${BREEZE_CACHE_HOST_PATH:-./cache}:/cache"

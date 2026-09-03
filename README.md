@@ -203,9 +203,11 @@ BREEZE_CACHE_HOST_PATH=/mnt/user/appdata/breeze-tts/cache \
 docker compose up -d --build
 ```
 
-The model share must contain `Breeze-TTS-2/` and the configured
-`BREEZE_WEIGHTS_FILE`. Override `BREEZE_WEIGHTS_FILE` or set
-`BREEZE_WEIGHTS_PATH` when using a different checkpoint filename.
+On first start, a missing default hybrid model is downloaded from the
+`drbaph/Breeze-TTS-2-comfyui` mirror into the configured model path. The
+model share must therefore be writable. Override `BREEZE_WEIGHTS_FILE` or set
+`BREEZE_WEIGHTS_PATH` for a custom checkpoint; custom checkpoints are never
+downloaded automatically.
 
 ### ⚡ Fast Inference Options
 
