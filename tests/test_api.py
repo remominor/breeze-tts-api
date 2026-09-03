@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from breeze_infer.api import (
     DEFAULT_CFG_SCALE,
     DEFAULT_INSTRUCTION,
+    _lifespan,
     _normalise_instruction_for_cfg,
     _parse_seed,
     _parse_stream,
@@ -290,6 +291,24 @@ def test_unloaded_speech_lazily_loads_and_load_errors_are_http_500(monkeypatch) 
     with pytest.raises(HTTPException, match="Model load failed") as exc_info:
         asyncio.run(speech(_JsonRequest({"input": "hello"})))
     assert exc_info.value.status_code == 500
+
+
+def test_startup_load_failure_keeps_server_idle_for_later_retry(monkeypatch, tmp_path) -> None:
+    import breeze_infer.api as api_module
+
+    monkeypatch.setattr(api_module, "_settings", SimpleNamespace(voice_dir=tmp_path))
+    monkeypatch.setattr(
+        api_module,
+        "_load_app",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("CUDA out of memory")),
+    )
+
+    async def start_server() -> None:
+        async with _lifespan(app):
+            assert app.state.runtime is None
+            assert app.state.model_load_error == "CUDA out of memory"
+
+    asyncio.run(start_server())
 
 
 def test_abandoned_stream_background_releases_inference_lock(monkeypatch) -> None:

@@ -256,8 +256,29 @@ def _ensure_model_loaded(app: FastAPI) -> bool:
     """Load model resources when absent; callers must hold ``_request_lock``."""
     if _model_is_loaded(app):
         return False
-    _load_app(app, app.state.cfg)
+    try:
+        _load_app(app, app.state.cfg)
+    except Exception as exc:
+        # ``_load_app`` publishes state only after all components are ready,
+        # but a failed CUDA allocation can leave allocator cache behind.
+        app.state.model_load_error = str(exc)
+        _release_cuda_memory()
+        raise
+    app.state.model_load_error = None
     return True
+
+
+def _release_cuda_memory() -> None:
+    """Best-effort collection of tensors left by an unsuccessful transition."""
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        logger.warning("CUDA cleanup after model transition was incomplete", exc_info=True)
 
 
 def _unload_app(app: FastAPI) -> bool:
@@ -272,15 +293,8 @@ def _unload_app(app: FastAPI) -> bool:
     app.state.tokenizer = None
     app.state.model = None
     app.state.audio_tokenizer = None
-    gc.collect()
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-    except Exception:
-        logger.warning("CUDA cleanup after model unload was incomplete", exc_info=True)
+    app.state.model_load_error = None
+    _release_cuda_memory()
     return True
 
 
@@ -291,9 +305,22 @@ async def _lifespan(app: FastAPI):
     app.state.cfg = _settings
     app.state.profiles = ProfileStore(_settings.voice_dir)
     app.state.metrics = {"requests_total": 0, "requests_success": 0, "requests_error": 0, "requests_busy": 0, "streaming_total": 0, "streaming_design": 0, "streaming_clone": 0, "ttfa_ms": [], "latency_ms": []}
-    _load_app(app, _settings)
+    app.state.runtime = None
+    app.state.eager_runtime = None
+    app.state.tokenizer = None
+    app.state.model = None
+    app.state.audio_tokenizer = None
+    app.state.model_load_error = None
     app.state.start_time = time.monotonic()
+    try:
+        _ensure_model_loaded(app)
+    except Exception:
+        # Keep the HTTP service alive after e.g. a transient CUDA OOM. The
+        # explicit load endpoint and GPU-using requests can retry later.
+        logger.exception("Breeze model was not loaded at startup; server is idle")
     yield
+    if _model_is_loaded(app):
+        _unload_app(app)
 
 
 app = FastAPI(title="Breeze TTS API", lifespan=_lifespan)
@@ -320,7 +347,8 @@ async def cors_middleware(request: Request, call_next):
 @app.get("/health")
 def health() -> JSONResponse:
     if not _model_is_loaded(app):
-        return JSONResponse({"status": "unloaded", "ready": False, "model_loaded": False}, status_code=503)
+        status = "load_failed" if getattr(app.state, "model_load_error", None) else "unloaded"
+        return JSONResponse({"status": status, "ready": False, "model_loaded": False}, status_code=503)
     runtime = app.state.runtime
     return JSONResponse({"status": "healthy", "ready": True, "model_loaded": True, "uptime_s": round(time.monotonic() - app.state.start_time, 1), "model_id": "breeze-tts-2", "sample_rate": runtime.sample_rate, "hybrid_quantized": app.state.cfg.weights is not None, "fast_enabled": runtime.fast_enabled, "profile_count": len(app.state.profiles.list()), "memory_rss_mb": round(psutil.Process().memory_info().rss / 1024 / 1024, 1)})
 
