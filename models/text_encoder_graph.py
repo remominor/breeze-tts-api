@@ -9,6 +9,8 @@ from typing import Any
 
 import torch
 
+from .cudagraph.capture_resources import get_capture_resources
+
 
 @dataclass
 class _GraphRecord:
@@ -34,7 +36,6 @@ class TextEncoderGraphCache:
         self.token_granularity = int(token_granularity)
         self._records: dict[tuple[int, int], _GraphRecord] = {}
         self._lock = threading.RLock()
-        self._graph_pool = torch.cuda.graph_pool_handle()
         self.captures = 0
         self.replays = 0
         self._frozen = False
@@ -92,7 +93,9 @@ class TextEncoderGraphCache:
                 static_positions = torch.zeros_like(static_mask)
                 self._copy_inputs(segments, static_ids, static_mask, static_positions)
 
-                capture_stream = torch.cuda.Stream(device=device)
+                capture_stream, pool = get_capture_resources(
+                    "text_encoder", device, key
+                )
                 capture_stream.wait_stream(torch.cuda.current_stream(device))
                 with torch.cuda.stream(capture_stream):
                     for _ in range(3):
@@ -108,7 +111,7 @@ class TextEncoderGraphCache:
                 with torch.cuda.graph(
                     graph,
                     stream=capture_stream,
-                    pool=self._graph_pool,
+                    pool=pool,
                     capture_error_mode="thread_local",
                 ):
                     static_output = self.text_encoder(

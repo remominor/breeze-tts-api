@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .capture_resources import get_capture_resources
+
 
 @dataclass
 class BackbonePrefillOutput:
@@ -42,7 +44,6 @@ class BackbonePrefillGraphCache:
         self.dtype = backbone_graph.dtype
         self.token_granularity = int(token_granularity)
         self._records: dict[tuple[int, int], _PrefillRecord] = {}
-        self._graph_pool = torch.cuda.graph_pool_handle()
         self._lock = threading.RLock()
         self.captures = 0
         self.replays = 0
@@ -166,7 +167,9 @@ class BackbonePrefillGraphCache:
                 )
                 self._update_causal_mask(static_mask, static_causal_mask)
 
-                capture_stream = torch.cuda.Stream(device=inputs_embeds.device)
+                capture_stream, pool = get_capture_resources(
+                    "backbone_prefill", inputs_embeds.device, key
+                )
                 capture_stream.wait_stream(
                     torch.cuda.current_stream(inputs_embeds.device)
                 )
@@ -184,7 +187,7 @@ class BackbonePrefillGraphCache:
                 with torch.cuda.graph(
                     graph,
                     stream=capture_stream,
-                    pool=self._graph_pool,
+                    pool=pool,
                     capture_error_mode="thread_local",
                 ):
                     hidden_states, logits = self._forward(

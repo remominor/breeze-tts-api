@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from ...cudagraph.capture_resources import get_capture_resources
 from ..core.compat import (
     Qwen3TTSTokenizer,
     Qwen3TTSTokenizerV2CausalConvNet,
@@ -396,7 +397,9 @@ class ExecutionLane:
         device = self.codes_in_buf.device
         if device.type != "cuda":
             raise RuntimeError("codec CUDA Graph fast path requires CUDA")
-        capture_stream = torch.cuda.Stream(device=device)
+        capture_stream, pool = get_capture_resources(
+            "codec", device, (self.chunk_frames, self.codes_in_buf.shape[0])
+        )
         capture_stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(capture_stream):
             for _ in range(max(1, warmup_rounds)):
@@ -408,6 +411,7 @@ class ExecutionLane:
             with torch.cuda.graph(
                 self.cuda_graph,
                 stream=capture_stream,
+                pool=pool,
                 capture_error_mode="thread_local",
             ):
                 self.cuda_graph_out = self.step_model(

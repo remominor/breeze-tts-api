@@ -35,6 +35,7 @@ from transformers import StaticCache
 from transformers.masking_utils import create_causal_mask
 
 from ..logits_process import mask_invalid_codec_token_logits
+from .capture_resources import get_capture_resources
 
 _log = logging.getLogger(__name__)
 
@@ -789,7 +790,7 @@ class DepthDecoderGraph:
         torch.cuda.synchronize(device=self.device)
 
         # Capture
-        s = torch.cuda.Stream(device=self.device)
+        s, pool = get_capture_resources("depth_decoder", self.device, bsz)
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             self.graph = torch.cuda.CUDAGraph()
@@ -798,7 +799,7 @@ class DepthDecoderGraph:
             torch.cuda.synchronize(device=self.device)
 
             self.static_cache.reset()
-            with torch.cuda.graph(self.graph):
+            with torch.cuda.graph(self.graph, stream=s, pool=pool):
                 self._full_loop()
 
         torch.cuda.current_stream().wait_stream(s)
