@@ -22,7 +22,9 @@ from breeze_infer.api import (
     _quiet_expected_torch_compile_warnings,
     _voice_item,
     app,
+    load_model,
     speech,
+    unload_model,
 )
 from breeze_infer.api import (
     MAX_NEW_TOKENS as API_MAX_NEW_TOKENS,
@@ -98,6 +100,8 @@ def test_api_exposes_only_health_and_streaming_speech() -> None:
 
     assert "/health" in paths
     assert "/v1/audio/speech" in paths
+    assert "/v1/model/load" in paths
+    assert "/v1/model/unload" in paths
     assert "/api/ref-audio-codes" not in paths
 
 
@@ -246,6 +250,46 @@ def test_pcm16_clips_and_encodes_little_endian() -> None:
     encoded = _pcm16(np.array([-2.0, 0.0, 2.0], dtype=np.float32))
 
     assert np.frombuffer(encoded, dtype="<i2").tolist() == [-32767, 0, 32767]
+
+
+def test_model_load_and_unload_endpoints_manage_runtime(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    assert unload_model() == {
+        "status": "unloaded", "model_loaded": False, "was_loaded": True
+    }
+    assert app.state.runtime is None
+
+    def fake_load(target_app, _settings):
+        target_app.state.runtime = SimpleNamespace(fast_enabled=False)
+
+    monkeypatch.setattr(api_module, "_load_app", fake_load)
+    assert load_model() == {
+        "status": "loaded", "model_loaded": True, "already_loaded": False
+    }
+    assert load_model()["already_loaded"] is True
+
+
+def test_unloaded_speech_lazily_loads_and_load_errors_are_http_500(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    runtime = app.state.runtime
+    app.state.runtime = None
+
+    def fake_load(target_app, _settings):
+        target_app.state.runtime = runtime
+
+    monkeypatch.setattr(api_module, "_load_app", fake_load)
+    response = asyncio.run(speech(_JsonRequest({"input": "hello"})))
+    assert response.status_code == 200
+
+    app.state.runtime = None
+    monkeypatch.setattr(api_module, "_load_app", lambda *_args: (_ for _ in ()).throw(RuntimeError("GPU unavailable")))
+    with pytest.raises(HTTPException, match="Model load failed") as exc_info:
+        asyncio.run(speech(_JsonRequest({"input": "hello"})))
+    assert exc_info.value.status_code == 500
 
 
 def test_abandoned_stream_background_releases_inference_lock(monkeypatch) -> None:

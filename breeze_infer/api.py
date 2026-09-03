@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import gc
 import json
 import logging
 import tempfile
@@ -247,6 +248,42 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     app.state.eager_runtime = eager_runtime
 
 
+def _model_is_loaded(app: FastAPI) -> bool:
+    return getattr(app.state, "runtime", None) is not None
+
+
+def _ensure_model_loaded(app: FastAPI) -> bool:
+    """Load model resources when absent; callers must hold ``_request_lock``."""
+    if _model_is_loaded(app):
+        return False
+    _load_app(app, app.state.cfg)
+    return True
+
+
+def _unload_app(app: FastAPI) -> bool:
+    """Release all model and CUDA-graph references; caller holds the lock."""
+    if not _model_is_loaded(app):
+        return False
+
+    # Clear application references before collecting so compiled modules and
+    # CUDA graph pools can be reclaimed instead of remaining reachable.
+    app.state.runtime = None
+    app.state.eager_runtime = None
+    app.state.tokenizer = None
+    app.state.model = None
+    app.state.audio_tokenizer = None
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        logger.warning("CUDA cleanup after model unload was incomplete", exc_info=True)
+    return True
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     if _settings is None:
@@ -282,10 +319,37 @@ async def cors_middleware(request: Request, call_next):
 
 @app.get("/health")
 def health() -> JSONResponse:
-    if not hasattr(app.state, "runtime"):
-        return JSONResponse({"status": "starting", "ready": False, "model_loaded": False}, status_code=503)
+    if not _model_is_loaded(app):
+        return JSONResponse({"status": "unloaded", "ready": False, "model_loaded": False}, status_code=503)
     runtime = app.state.runtime
     return JSONResponse({"status": "healthy", "ready": True, "model_loaded": True, "uptime_s": round(time.monotonic() - app.state.start_time, 1), "model_id": "breeze-tts-2", "sample_rate": runtime.sample_rate, "hybrid_quantized": app.state.cfg.weights is not None, "fast_enabled": runtime.fast_enabled, "profile_count": len(app.state.profiles.list()), "memory_rss_mb": round(psutil.Process().memory_info().rss / 1024 / 1024, 1)})
+
+
+@app.post("/v1/model/load")
+def load_model() -> dict:
+    """Load Breeze onto the configured device, including enabled fast graphs."""
+    if not _request_lock.acquire(blocking=False):
+        raise HTTPException(409, "An inference request or model transition is already running.")
+    try:
+        loaded = _ensure_model_loaded(app)
+    except Exception as exc:
+        logger.exception("Breeze model load failed")
+        raise HTTPException(500, f"Model load failed: {exc}") from exc
+    finally:
+        _request_lock.release()
+    return {"status": "loaded", "model_loaded": True, "already_loaded": not loaded}
+
+
+@app.post("/v1/model/unload")
+def unload_model() -> dict:
+    """Unload Breeze model resources from GPU memory."""
+    if not _request_lock.acquire(blocking=False):
+        raise HTTPException(409, "An inference request or model transition is already running.")
+    try:
+        unloaded = _unload_app(app)
+    finally:
+        _request_lock.release()
+    return {"status": "unloaded", "model_loaded": False, "was_loaded": unloaded}
 
 
 @app.get("/metrics")
@@ -347,6 +411,11 @@ async def upload_voice(request: Request) -> dict:
         if not _request_lock.acquire(blocking=False):
             raise HTTPException(409, "An inference request is already running.")
         try:
+            try:
+                _ensure_model_loaded(app)
+            except Exception as exc:
+                logger.exception("Breeze model load failed while preloading voice")
+                raise HTTPException(500, f"Model load failed: {exc}") from exc
             reference_codes = await asyncio.to_thread(
                 _encode_reference_bytes, app.state.audio_tokenizer, data
             )
@@ -449,6 +518,11 @@ async def speech(request: Request):
             _request_lock.release()
 
     try:
+        try:
+            _ensure_model_loaded(app)
+        except Exception as exc:
+            logger.exception("Breeze model load failed while serving request")
+            raise HTTPException(500, f"Model load failed: {exc}") from exc
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type: form = await request.json(); upload = None
         else:
