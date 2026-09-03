@@ -14,17 +14,26 @@ def _payload() -> dict:
     return json.loads((REPO_ROOT / "configs" / "fast.json").read_text())
 
 
-def test_bundled_config_covers_cfg4_low_vram_and_voice_direction_profile() -> None:
+def test_bundled_config_covers_no_cfg_and_guided_fast_paths() -> None:
     profile = load_warmup_profile(REPO_ROOT / "configs" / "fast.json")
 
-    assert profile.cfg_scales == (4.0,)
-    assert profile.cfg_modes == ("single_cfg",)
-    assert profile.backbone_decode_branch_batch_sizes == (2,)
-    assert profile.depth_decoder_batch_sizes == (2,)
+    assert profile.cfg_scales == (1.0, 4.0)
+    assert profile.cfg_modes == ("no_cfg", "single_cfg")
+    assert profile.backbone_decode_branch_batch_sizes == (1, 2)
+    assert profile.depth_decoder_batch_sizes == (1, 2)
     assert profile.codec_num_lanes == 1
     assert profile.codec_chunk_frames == 1
     assert profile.freeze_after_warmup is True
-    assert {graph.branch_batch_size for graph in profile.backbone_prefill_graphs} == {2}
+    assert {graph.branch_batch_size for graph in profile.backbone_prefill_graphs} == {
+        1,
+        2,
+    }
+    no_cfg_text_lengths = [
+        graph.token_length
+        for graph in profile.text_encoder_graphs
+        if graph.batch_size == 1
+    ]
+    assert no_cfg_text_lengths == list(range(32, 513, 32))
     cfg_guided_text_lengths = [
         graph.token_length
         for graph in profile.text_encoder_graphs

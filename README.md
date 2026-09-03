@@ -28,8 +28,8 @@ paths, and explicit GPU model load/unload controls.
 ## Requirements
 
 - Linux, NVIDIA CUDA GPU, and a compatible NVIDIA driver.
-- About 12 GB VRAM for practical eager serving. Fast CUDA-graph stages require
-  more VRAM and add a cold-start warmup.
+- An 8 GB NVIDIA GPU is the practical target for the default hybrid fast
+  configuration. Exact usage varies by GPU, driver, and enabled graph stages.
 - Python 3.12 is used by the Docker image. A local install needs compatible
   CUDA PyTorch, compiler tooling, and Python dependencies.
 - Internet access on the first default-model load, unless files are present.
@@ -150,6 +150,11 @@ curl -X POST http://127.0.0.1:7860/v1/audio/speech \
   }' --output voice-design.wav
 ```
 
+`guidance_scale=1` uses the conditional branch only. Values other than 1 use
+the guided conditional/unconditional path. The fast profile prewarms both
+shapes, so CFG 1 is not silently changed and does not fall back to eager
+backbone/depth execution.
+
 ### Voice clone or direction
 
 Reference audio requires its exact transcript. Add an instruction and CFG 4 to
@@ -179,6 +184,30 @@ curl -X POST http://127.0.0.1:7860/v1/model/load
 Only GPU-using requests auto-load: speech synthesis and voice upload with
 `preload=true`. Health, metrics, model metadata, and voice/profile CRUD remain
 available while unloaded.
+
+### Metrics and benchmarking
+
+`GET /metrics` retains the original flat request counters and also reports
+structured `process`, `cuda`, `model_lifecycle`, `inference`, and
+`last_request` data. CUDA data includes PyTorch allocator figures and, when
+NVML is available, nvidia-smi-style memory attributed to this server process.
+Reading metrics while unloaded does not load the model or create a CUDA
+context.
+
+Compare the prewarmed CFG paths against a running server:
+
+```bash
+python scripts/benchmark_api.py --guidance-scale 1 --runs 3 \
+  --output benchmark-cfg1.json
+python scripts/benchmark_api.py --guidance-scale 4 \
+  --instruction "Speak clearly and naturally." --runs 3 \
+  --output benchmark-cfg4.json
+```
+
+Include an unload/reload measurement with `--reload-before-first`. Benchmark
+JSON records the request, client timing, server timing, generated duration,
+RTF, process/GPU snapshot, and model lifecycle timing. Keep prompts, seed,
+fast flags, model checkpoint, GPU, and driver identical when comparing runs.
 
 ## Profiles and endpoint summary
 

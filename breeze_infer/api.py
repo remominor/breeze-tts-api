@@ -1,4 +1,5 @@
 """OpenAI/OmniVoice-shaped HTTP API for Breeze TTS 2."""
+
 from __future__ import annotations
 
 import argparse
@@ -25,6 +26,13 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from breeze_infer.audio import encode_prompt_audio
+from breeze_infer.observability import (
+    cuda_snapshot,
+    new_service_metrics,
+    observe,
+    process_snapshot,
+    stats_snapshot,
+)
 from breeze_infer.profiles import ProfileExistsError, ProfileNotFoundError, ProfileStore
 from breeze_infer.runtime import (
     load_runtime,
@@ -72,9 +80,7 @@ def _quiet_expected_torch_compile_warnings() -> None:
     # These warnings are emitted while torch.compile specializes the codec and
     # first eager backbone request.  They do not indicate a synthesis error;
     # keep the rest of torch and API logging at their normal levels.
-    logging.getLogger("torch.fx.experimental.symbolic_shapes").setLevel(
-        logging.ERROR
-    )
+    logging.getLogger("torch.fx.experimental.symbolic_shapes").setLevel(logging.ERROR)
     logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
     try:
         import torch
@@ -93,7 +99,16 @@ def _pcm16(audio: np.ndarray) -> bytes:
 
 def _wav(pcm: bytes, sample_rate: int) -> bytes:
     import struct
-    return b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16) + b"data" + struct.pack("<I", len(pcm)) + pcm
+
+    return (
+        b"RIFF"
+        + struct.pack("<I", 36 + len(pcm))
+        + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16)
+        + b"data"
+        + struct.pack("<I", len(pcm))
+        + pcm
+    )
 
 
 def _prompt_token_count(inputs: dict) -> int:
@@ -105,9 +120,7 @@ def _prompt_token_count(inputs: dict) -> int:
         "cfg_ins_prompt_ids",
     )
     lengths = [
-        int(inputs[key].shape[1])
-        for key in prompt_keys
-        if inputs.get(key) is not None
+        int(inputs[key].shape[1]) for key in prompt_keys if inputs.get(key) is not None
     ]
     return max(lengths, default=0)
 
@@ -158,7 +171,13 @@ async def _upload_bytes(upload: UploadFile | None, limit: int) -> bytes | None:
     return data
 
 
-def _profile_request(store: ProfileStore, voice: str | None, *, ref_text: str | None, instruction: str | None) -> tuple[dict, str]:
+def _profile_request(
+    store: ProfileStore,
+    voice: str | None,
+    *,
+    ref_text: str | None,
+    instruction: str | None,
+) -> tuple[dict, str]:
     voice = (voice or "voice-design").strip()
     try:
         profile_id = store.resolve(voice.removeprefix("clone:"))
@@ -166,7 +185,9 @@ def _profile_request(store: ProfileStore, voice: str | None, *, ref_text: str | 
         profile_id = None
     if profile_id:
         profile = store.get(profile_id)
-        effective_ref_text = ref_text.strip() if ref_text and ref_text.strip() else profile["ref_text"]
+        effective_ref_text = (
+            ref_text.strip() if ref_text and ref_text.strip() else profile["ref_text"]
+        )
         request = {"ref_text": effective_ref_text, "speaker": "S0"}
         codes = store.load_codes(profile_id)
         if codes is not None:
@@ -183,8 +204,6 @@ def _profile_request(store: ProfileStore, voice: str | None, *, ref_text: str | 
 def _normalise_instruction_for_cfg(
     instruction: str,
     cfg_value: object,
-    *,
-    fast_enabled: bool,
 ) -> tuple[str, float]:
     """Return a valid instruction/CFG pairing for the Breeze templates.
 
@@ -192,9 +211,8 @@ def _normalise_instruction_for_cfg(
     clone templates deliberately have no negative branch, so an empty design
     instruction together with CFG > 1 used to reach ``prepare_inputs`` as an
     invalid combination.  Treat a blank instruction as a request for the
-    neutral instruction in that case.  The low-VRAM fast profile only captures
-    its two-branch CFG path, so CFG=1 is promoted to its safe CFG=4 default
-    while that profile is active instead of falling back to eager inference.
+    neutral instruction in that case. CFG=1 is a true conditional-only path;
+    it must not be silently promoted to a guided request.
     """
     try:
         scale = (
@@ -203,15 +221,11 @@ def _normalise_instruction_for_cfg(
             else (4.0 if instruction else 1.0)
         )
     except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            422, "guidance_scale/cfg_scale must be a number"
-        ) from exc
+        raise HTTPException(422, "guidance_scale/cfg_scale must be a number") from exc
     if not np.isfinite(scale) or scale <= 0:
         raise HTTPException(
             422, "guidance_scale/cfg_scale must be finite and greater than 0"
         )
-    if fast_enabled and scale == 1.0:
-        return instruction or DEFAULT_INSTRUCTION, 4.0
     if not instruction and scale != 1.0:
         return DEFAULT_INSTRUCTION, scale
     return instruction, scale
@@ -219,33 +233,41 @@ def _normalise_instruction_for_cfg(
 
 def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     _quiet_expected_torch_compile_warnings()
-    tokenizer, model, audio_tokenizer = load_runtime(settings.model, device=resolve_device(), attn_implementation="eager", weights_path=settings.weights)
+    tokenizer, model, audio_tokenizer = load_runtime(
+        settings.model,
+        device=resolve_device(),
+        attn_implementation="eager",
+        weights_path=settings.weights,
+    )
     update_generation_config_for_breeze(model)
-    runtime = FastBreezeStreamingRuntime(model, audio_tokenizer, FastStreamingConfig(max_new_tokens=MAX_NEW_TOKENS, max_seq_len=MAX_SEQ_LEN, fast_all=settings.fast_all, fast_text_encoder=settings.fast_text_encoder, fast_backbone_prefill=settings.fast_backbone_prefill, fast_backbone_decode=settings.fast_backbone_decode, fast_depth_decoder=settings.fast_depth_decoder, fast_codec=settings.fast_codec, repetition_penalty=REPETITION_PENALTY), tokenizer=tokenizer)
+    runtime = FastBreezeStreamingRuntime(
+        model,
+        audio_tokenizer,
+        FastStreamingConfig(
+            max_new_tokens=MAX_NEW_TOKENS,
+            max_seq_len=MAX_SEQ_LEN,
+            fast_all=settings.fast_all,
+            fast_text_encoder=settings.fast_text_encoder,
+            fast_backbone_prefill=settings.fast_backbone_prefill,
+            fast_backbone_decode=settings.fast_backbone_decode,
+            fast_depth_decoder=settings.fast_depth_decoder,
+            fast_codec=settings.fast_codec,
+            repetition_penalty=REPETITION_PENALTY,
+        ),
+        tokenizer=tokenizer,
+    )
     if runtime.fast_enabled:
-        profile = replace(load_warmup_profile(FAST_CONFIG), codec_chunk_frames=runtime.codec_chunk_frames)
-        runtime.warmup_from_profile(profile)
-    eager_runtime = None
-    if runtime.fast_enabled:
-        eager_runtime = FastBreezeStreamingRuntime(
-            model,
-            audio_tokenizer,
-            FastStreamingConfig(
-                max_new_tokens=MAX_NEW_TOKENS,
-                max_seq_len=MAX_SEQ_LEN,
-                # Leave the master switch unset so only fast_codec below is
-                # enabled; ``fast_all=False`` would override every stage.
-                fast_all=None,
-                # Keep the requested one-frame codec path for CFG=1 fallback
-                # requests.  Backbone/depth stay eager, while this avoids the
-                # harmless-but-noisy residual-tail codec path.
-                fast_codec=settings.fast_codec,
-                repetition_penalty=REPETITION_PENALTY,
-            ),
-            tokenizer=tokenizer,
+        profile = replace(
+            load_warmup_profile(FAST_CONFIG),
+            codec_chunk_frames=runtime.codec_chunk_frames,
         )
-    app.state.tokenizer, app.state.model, app.state.audio_tokenizer, app.state.runtime = tokenizer, model, audio_tokenizer, runtime
-    app.state.eager_runtime = eager_runtime
+        runtime.warmup_from_profile(profile)
+    (
+        app.state.tokenizer,
+        app.state.model,
+        app.state.audio_tokenizer,
+        app.state.runtime,
+    ) = tokenizer, model, audio_tokenizer, runtime
 
 
 def _model_is_loaded(app: FastAPI) -> bool:
@@ -256,15 +278,22 @@ def _ensure_model_loaded(app: FastAPI) -> bool:
     """Load model resources when absent; callers must hold ``_request_lock``."""
     if _model_is_loaded(app):
         return False
+    metrics = app.state.metrics
+    metrics["model_load_attempts"] += 1
+    started = time.perf_counter()
     try:
         _load_app(app, app.state.cfg)
     except Exception as exc:
         # ``_load_app`` publishes state only after all components are ready,
         # but a failed CUDA allocation can leave allocator cache behind.
         app.state.model_load_error = str(exc)
+        metrics["model_load_failures"] += 1
         _release_cuda_memory()
         raise
+    finally:
+        observe(metrics, "model_load_ms", (time.perf_counter() - started) * 1000)
     app.state.model_load_error = None
+    metrics["model_load_successes"] += 1
     return True
 
 
@@ -278,7 +307,9 @@ def _release_cuda_memory() -> None:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
     except Exception:
-        logger.warning("CUDA cleanup after model transition was incomplete", exc_info=True)
+        logger.warning(
+            "CUDA cleanup after model transition was incomplete", exc_info=True
+        )
 
 
 def _unload_app(app: FastAPI) -> bool:
@@ -286,15 +317,21 @@ def _unload_app(app: FastAPI) -> bool:
     if not _model_is_loaded(app):
         return False
 
+    started = time.perf_counter()
     # Clear application references before collecting so compiled modules and
     # CUDA graph pools can be reclaimed instead of remaining reachable.
     app.state.runtime = None
-    app.state.eager_runtime = None
     app.state.tokenizer = None
     app.state.model = None
     app.state.audio_tokenizer = None
     app.state.model_load_error = None
     _release_cuda_memory()
+    app.state.metrics["model_unloads"] += 1
+    observe(
+        app.state.metrics,
+        "model_unload_ms",
+        (time.perf_counter() - started) * 1000,
+    )
     return True
 
 
@@ -304,9 +341,8 @@ async def _lifespan(app: FastAPI):
         raise RuntimeError("API settings are not initialized")
     app.state.cfg = _settings
     app.state.profiles = ProfileStore(_settings.voice_dir)
-    app.state.metrics = {"requests_total": 0, "requests_success": 0, "requests_error": 0, "requests_busy": 0, "streaming_total": 0, "streaming_design": 0, "streaming_clone": 0, "ttfa_ms": [], "latency_ms": []}
+    app.state.metrics = new_service_metrics()
     app.state.runtime = None
-    app.state.eager_runtime = None
     app.state.tokenizer = None
     app.state.model = None
     app.state.audio_tokenizer = None
@@ -329,17 +365,23 @@ app = FastAPI(title="Breeze TTS API", lifespan=_lifespan)
 @app.middleware("http")
 async def cors_middleware(request: Request, call_next):
     origin = request.headers.get("origin")
-    configured = _settings.cors_origins if _settings is not None else ApiSettings.cors_origins
+    configured = (
+        _settings.cors_origins if _settings is not None else ApiSettings.cors_origins
+    )
     allowed = origin and ("*" in configured or origin in configured)
     if request.method == "OPTIONS" and allowed:
         response = Response(status_code=204)
     else:
         response = await call_next(request)
     if allowed:
-        response.headers["Access-Control-Allow-Origin"] = "*" if "*" in configured else origin
+        response.headers["Access-Control-Allow-Origin"] = (
+            "*" if "*" in configured else origin
+        )
         response.headers["Access-Control-Allow-Methods"] = "*"
         response.headers["Access-Control-Allow-Headers"] = "*"
-        response.headers["Access-Control-Expose-Headers"] = "X-Sample-Rate, X-Audio-Sample-Rate, X-Request-Id, X-Sample-Format"
+        response.headers["Access-Control-Expose-Headers"] = (
+            "X-Sample-Rate, X-Audio-Sample-Rate, X-Request-Id, X-Sample-Format"
+        )
         response.headers["Vary"] = "Origin"
     return response
 
@@ -347,17 +389,38 @@ async def cors_middleware(request: Request, call_next):
 @app.get("/health")
 def health() -> JSONResponse:
     if not _model_is_loaded(app):
-        status = "load_failed" if getattr(app.state, "model_load_error", None) else "unloaded"
-        return JSONResponse({"status": status, "ready": False, "model_loaded": False}, status_code=503)
+        status = (
+            "load_failed"
+            if getattr(app.state, "model_load_error", None)
+            else "unloaded"
+        )
+        return JSONResponse(
+            {"status": status, "ready": False, "model_loaded": False}, status_code=503
+        )
     runtime = app.state.runtime
-    return JSONResponse({"status": "healthy", "ready": True, "model_loaded": True, "uptime_s": round(time.monotonic() - app.state.start_time, 1), "model_id": "breeze-tts-2", "sample_rate": runtime.sample_rate, "hybrid_quantized": app.state.cfg.weights is not None, "fast_enabled": runtime.fast_enabled, "profile_count": len(app.state.profiles.list()), "memory_rss_mb": round(psutil.Process().memory_info().rss / 1024 / 1024, 1)})
+    return JSONResponse(
+        {
+            "status": "healthy",
+            "ready": True,
+            "model_loaded": True,
+            "uptime_s": round(time.monotonic() - app.state.start_time, 1),
+            "model_id": "breeze-tts-2",
+            "sample_rate": runtime.sample_rate,
+            "hybrid_quantized": app.state.cfg.weights is not None,
+            "fast_enabled": runtime.fast_enabled,
+            "profile_count": len(app.state.profiles.list()),
+            "memory_rss_mb": round(psutil.Process().memory_info().rss / 1024 / 1024, 1),
+        }
+    )
 
 
 @app.post("/v1/model/load")
 def load_model() -> dict:
     """Load Breeze onto the configured device, including enabled fast graphs."""
     if not _request_lock.acquire(blocking=False):
-        raise HTTPException(409, "An inference request or model transition is already running.")
+        raise HTTPException(
+            409, "An inference request or model transition is already running."
+        )
     try:
         loaded = _ensure_model_loaded(app)
     except Exception as exc:
@@ -372,7 +435,9 @@ def load_model() -> dict:
 def unload_model() -> dict:
     """Unload Breeze model resources from GPU memory."""
     if not _request_lock.acquire(blocking=False):
-        raise HTTPException(409, "An inference request or model transition is already running.")
+        raise HTTPException(
+            409, "An inference request or model transition is already running."
+        )
     try:
         unloaded = _unload_app(app)
     finally:
@@ -383,23 +448,108 @@ def unload_model() -> dict:
 @app.get("/metrics")
 def metrics() -> dict:
     values = app.state.metrics
-    return {**{key: value for key, value in values.items() if key not in {"ttfa_ms", "latency_ms"}}, "latency_ms_mean": round(sum(values["latency_ms"]) / len(values["latency_ms"]), 1) if values["latency_ms"] else 0.0, "streaming_ttfa_ms_mean": round(sum(values["ttfa_ms"]) / len(values["ttfa_ms"]), 1) if values["ttfa_ms"] else 0.0, "memory_rss_mb": round(psutil.Process().memory_info().rss / 1024 / 1024, 1), "profile_cache_entries": sum(1 for p in app.state.profiles.list() if p.get("cached"))}
+    latency = stats_snapshot(values, "latency_ms")
+    ttfa = stats_snapshot(values, "ttfa_ms")
+    rtf = stats_snapshot(values, "rtf")
+    process = process_snapshot(app.state.start_time)
+    cuda = cuda_snapshot()
+    counters = {
+        key: value for key, value in values.items() if isinstance(value, (int, float))
+    }
+    settings = app.state.cfg
+    fast_stages = {
+        stage: (
+            bool(settings.fast_all)
+            if settings.fast_all is not None
+            else bool(getattr(settings, f"fast_{stage}", False))
+        )
+        for stage in (
+            "text_encoder",
+            "backbone_prefill",
+            "backbone_decode",
+            "depth_decoder",
+            "codec",
+        )
+    }
+    return {
+        **counters,
+        "latency_ms_mean": latency["mean"] or 0.0,
+        "streaming_ttfa_ms_mean": ttfa["mean"] or 0.0,
+        "memory_rss_mb": process["rss_mb"],
+        "profile_cache_entries": sum(
+            1 for profile in app.state.profiles.list() if profile.get("cached")
+        ),
+        "process": process,
+        "cuda": cuda,
+        "model": {
+            "id": "breeze-tts-2",
+            "loaded": _model_is_loaded(app),
+            "weights_file": (
+                Path(settings.weights).name if settings.weights is not None else None
+            ),
+            "hybrid_quantized": settings.weights is not None,
+            "fast_enabled": any(fast_stages.values()),
+            "fast_stages": fast_stages,
+            "warmup_profile": FAST_CONFIG.name if any(fast_stages.values()) else None,
+        },
+        "model_lifecycle": {
+            "load_attempts": values["model_load_attempts"],
+            "load_successes": values["model_load_successes"],
+            "load_failures": values["model_load_failures"],
+            "unloads": values["model_unloads"],
+            "load_ms": stats_snapshot(values, "model_load_ms"),
+            "unload_ms": stats_snapshot(values, "model_unload_ms"),
+        },
+        "inference": {
+            "cfg_no_cfg_requests": values["cfg_no_cfg_requests"],
+            "cfg_guided_requests": values["cfg_guided_requests"],
+            "generated_audio_seconds_total": round(
+                values["generated_audio_seconds_total"], 3
+            ),
+            "latency_ms": latency,
+            "ttfa_ms": ttfa,
+            "rtf": rtf,
+        },
+        "last_request": values["last_request"],
+    }
 
 
 @app.get("/v1/audio/models")
 @app.get("/v1/models")
 def models() -> dict:
-    return {"object": "list", "data": [{"id": "breeze-tts-2", "object": "model", "owned_by": "breezeblue"}]}
+    return {
+        "object": "list",
+        "data": [{"id": "breeze-tts-2", "object": "model", "owned_by": "breezeblue"}],
+    }
 
 
 def _voice_item(profile: dict) -> dict:
-    return {"id": profile["profile_id"], "voice_id": profile["profile_id"], "name": profile["name"], "object": "voice", "owned_by": "breezeblue", "ref_text": profile.get("ref_text", ""), "cached": profile.get("cached", False)}
+    return {
+        "id": profile["profile_id"],
+        "voice_id": profile["profile_id"],
+        "name": profile["name"],
+        "object": "voice",
+        "owned_by": "breezeblue",
+        "ref_text": profile.get("ref_text", ""),
+        "cached": profile.get("cached", False),
+    }
 
 
 @app.get("/v1/audio/voices")
 def voices() -> dict:
-    builtins = [{"id": "voice-design", "voice_id": "voice-design", "name": "voice-design", "object": "voice", "owned_by": "breezeblue"}]
-    return {"object": "list", "data": builtins + [_voice_item(p) for p in app.state.profiles.list()]}
+    builtins = [
+        {
+            "id": "voice-design",
+            "voice_id": "voice-design",
+            "name": "voice-design",
+            "object": "voice",
+            "owned_by": "breezeblue",
+        }
+    ]
+    return {
+        "object": "list",
+        "data": builtins + [_voice_item(p) for p in app.state.profiles.list()],
+    }
 
 
 @app.post("/upload_voice")
@@ -407,7 +557,9 @@ def voices() -> dict:
 async def upload_voice(request: Request) -> dict:
     form = await request.form()
     upload = form.get("voice_file")
-    data = await _upload_bytes(upload if hasattr(upload, "read") else None, app.state.cfg.max_ref_audio_bytes)
+    data = await _upload_bytes(
+        upload if hasattr(upload, "read") else None, app.state.cfg.max_ref_audio_bytes
+    )
     if data is None:
         url = str(form.get("voice_url") or "").strip()
         if not url.startswith(("http://", "https://")):
@@ -419,12 +571,20 @@ async def upload_voice(request: Request) -> dict:
         except (OSError, ValueError) as exc:
             raise HTTPException(400, f"Unable to download voice_url: {exc}") from exc
         if len(data) > app.state.cfg.max_ref_audio_bytes:
-            raise HTTPException(413, "voice_url response exceeds the configured size limit")
+            raise HTTPException(
+                413, "voice_url response exceeds the configured size limit"
+            )
     ref_text = str(form.get("ref_text") or form.get("reference_text") or "").strip()
     if not ref_text:
         raise HTTPException(422, "ref_text is required for Breeze voice profiles")
-    name = str(form.get("name") or form.get("voice_name") or uuid.uuid4().hex[:12]).strip()
-    profile_id = name if all(c.isalnum() or c in "-_" for c in name) and len(name) <= 64 else uuid.uuid4().hex
+    name = str(
+        form.get("name") or form.get("voice_name") or uuid.uuid4().hex[:12]
+    ).strip()
+    profile_id = (
+        name
+        if all(c.isalnum() or c in "-_" for c in name) and len(name) <= 64
+        else uuid.uuid4().hex
+    )
     overwrite = str(form.get("overwrite", "false")).lower() == "true"
     if not overwrite:
         try:
@@ -452,13 +612,20 @@ async def upload_voice(request: Request) -> dict:
         finally:
             _request_lock.release()
     try:
-        result = app.state.profiles.save(profile_id, data, ref_text, name=name, overwrite=overwrite)
+        result = app.state.profiles.save(
+            profile_id, data, ref_text, name=name, overwrite=overwrite
+        )
     except ProfileExistsError:
         raise HTTPException(409, "Voice profile already exists")
     if reference_codes is not None:
         app.state.profiles.save_codes(profile_id, reference_codes)
         result = app.state.profiles.get(profile_id)
-    return {"voice_id": profile_id, "id": profile_id, "name": result["name"], "cached": result.get("cached", False)}
+    return {
+        "voice_id": profile_id,
+        "id": profile_id,
+        "name": result["name"],
+        "cached": result.get("cached", False),
+    }
 
 
 def _profile_id(voice_id: str) -> str:
@@ -477,50 +644,154 @@ def get_voice(voice_id: str) -> dict:
 
 @app.patch("/v1/audio/voices/{voice_id}")
 async def update_voice(voice_id: str, request: Request) -> dict:
-    if voice_id == "voice-design": raise HTTPException(403, "Built-in voices cannot be modified")
-    profile_id = _profile_id(voice_id); body = await request.json()
-    result = app.state.profiles.update(profile_id, ref_text=body.get("ref_text"), name=body.get("name"))
+    if voice_id == "voice-design":
+        raise HTTPException(403, "Built-in voices cannot be modified")
+    profile_id = _profile_id(voice_id)
+    body = await request.json()
+    result = app.state.profiles.update(
+        profile_id, ref_text=body.get("ref_text"), name=body.get("name")
+    )
     return _voice_item(result)
 
 
 @app.delete("/v1/audio/voices/{voice_id}")
 def delete_voice(voice_id: str) -> dict:
-    if voice_id == "voice-design": raise HTTPException(403, "Built-in voices cannot be modified")
-    profile_id = _profile_id(voice_id); app.state.profiles.delete(profile_id)
+    if voice_id == "voice-design":
+        raise HTTPException(403, "Built-in voices cannot be modified")
+    profile_id = _profile_id(voice_id)
+    app.state.profiles.delete(profile_id)
     return {"deleted": True, "voice_id": profile_id}
 
 
 @app.post("/v1/voices/profiles")
 async def create_profile(request: Request) -> dict:
-    form = await request.form(); upload = form.get("ref_audio")
-    data = await _upload_bytes(upload if hasattr(upload, "read") else None, app.state.cfg.max_ref_audio_bytes)
-    profile_id = str(form.get("profile_id") or "").strip(); ref_text = str(form.get("ref_text") or "").strip()
-    if not profile_id or not data or not ref_text: raise HTTPException(422, "profile_id, ref_audio, and ref_text are required")
-    try: result = app.state.profiles.save(profile_id, data, ref_text, overwrite=str(form.get("overwrite", "false")).lower() == "true")
-    except ProfileExistsError as exc: raise HTTPException(409, "Voice profile already exists") from exc
-    except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+    form = await request.form()
+    upload = form.get("ref_audio")
+    data = await _upload_bytes(
+        upload if hasattr(upload, "read") else None, app.state.cfg.max_ref_audio_bytes
+    )
+    profile_id = str(form.get("profile_id") or "").strip()
+    ref_text = str(form.get("ref_text") or "").strip()
+    if not profile_id or not data or not ref_text:
+        raise HTTPException(422, "profile_id, ref_audio, and ref_text are required")
+    try:
+        result = app.state.profiles.save(
+            profile_id,
+            data,
+            ref_text,
+            overwrite=str(form.get("overwrite", "false")).lower() == "true",
+        )
+    except ProfileExistsError as exc:
+        raise HTTPException(409, "Voice profile already exists") from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     return result
 
 
 @app.get("/v1/voices/profiles")
 def list_profiles() -> dict:
-    return {"profiles": app.state.profiles.list(), "total": len(app.state.profiles.list())}
+    return {
+        "profiles": app.state.profiles.list(),
+        "total": len(app.state.profiles.list()),
+    }
 
 
 @app.get("/v1/voices/profiles/{profile_id}")
-def get_profile(profile_id: str) -> dict: return app.state.profiles.get(_profile_id(profile_id))
+def get_profile(profile_id: str) -> dict:
+    return app.state.profiles.get(_profile_id(profile_id))
 
 
 @app.patch("/v1/voices/profiles/{profile_id}")
 async def patch_profile(profile_id: str, request: Request) -> dict:
-    pid = _profile_id(profile_id); form = await request.form(); upload = form.get("ref_audio")
-    data = await _upload_bytes(upload if hasattr(upload, "read") else None, app.state.cfg.max_ref_audio_bytes)
-    return app.state.profiles.update(pid, audio=data, ref_text=str(form["ref_text"]) if "ref_text" in form else None)
+    pid = _profile_id(profile_id)
+    form = await request.form()
+    upload = form.get("ref_audio")
+    data = await _upload_bytes(
+        upload if hasattr(upload, "read") else None, app.state.cfg.max_ref_audio_bytes
+    )
+    return app.state.profiles.update(
+        pid, audio=data, ref_text=str(form["ref_text"]) if "ref_text" in form else None
+    )
 
 
 @app.delete("/v1/voices/profiles/{profile_id}")
 def remove_profile(profile_id: str) -> Response:
-    app.state.profiles.delete(_profile_id(profile_id)); return Response(status_code=204)
+    app.state.profiles.delete(_profile_id(profile_id))
+    return Response(status_code=204)
+
+
+def _collect_chunk_timings(totals: dict[str, float], chunk: object) -> None:
+    timing = getattr(chunk, "timing", None)
+    if not isinstance(timing, dict):
+        return
+    for name in ("codec_launch_ms", "audio_d2h_ms", "decode_launch_ms"):
+        value = timing.get(name)
+        if isinstance(value, (int, float)):
+            totals[name] = totals.get(name, 0.0) + float(value)
+    for name in ("prefill_gpu_ms", "ttfa_internal_ms"):
+        value = timing.get(name)
+        if isinstance(value, (int, float)) and name not in totals:
+            totals[name] = float(value)
+
+
+def _record_successful_request(
+    *,
+    request_id: str,
+    started: float,
+    first_audio_at: float | None,
+    pcm_bytes: int,
+    sample_rate: int,
+    scale: float,
+    streaming: bool,
+    clone: bool,
+    segments: int,
+    chunks: int,
+    internal_timings: dict[str, float],
+) -> None:
+    values = app.state.metrics
+    wall_ms = (time.perf_counter() - started) * 1000
+    audio_seconds = pcm_bytes / (2 * sample_rate)
+    rtf = wall_ms / 1000 / audio_seconds
+    ttfa_ms = (first_audio_at - started) * 1000 if first_audio_at is not None else None
+    values["requests_success"] += 1
+    values["generated_audio_seconds_total"] += audio_seconds
+    observe(values, "latency_ms", wall_ms)
+    observe(values, "rtf", rtf)
+    if streaming and ttfa_ms is not None:
+        observe(values, "ttfa_ms", ttfa_ms)
+    values["last_request"] = {
+        "request_id": request_id,
+        "status": "success",
+        "cfg_mode": "no_cfg" if scale == 1.0 else "single_cfg",
+        "guidance_scale": scale,
+        "runtime_path": "fast" if app.state.runtime.fast_enabled else "eager",
+        "streaming": streaming,
+        "clone": clone,
+        "segments": segments,
+        "chunks": chunks,
+        "wall_ms": round(wall_ms, 1),
+        "ttfa_ms": round(ttfa_ms, 1) if ttfa_ms is not None else None,
+        "audio_seconds": round(audio_seconds, 3),
+        "rtf": round(rtf, 4),
+        "internal_timing_ms": {
+            name: round(value, 2) for name, value in internal_timings.items()
+        },
+    }
+
+
+def _record_failed_request(
+    *, request_id: str, started: float, scale: float, streaming: bool, error: Exception
+) -> None:
+    app.state.metrics["last_request"] = {
+        "request_id": request_id,
+        "status": "error",
+        "cfg_mode": "no_cfg" if scale == 1.0 else "single_cfg",
+        "guidance_scale": scale,
+        "runtime_path": "fast" if app.state.runtime.fast_enabled else "eager",
+        "streaming": streaming,
+        "wall_ms": round((time.perf_counter() - started) * 1000, 1),
+        "error": str(error),
+    }
 
 
 @app.post("/v1/audio/speech")
@@ -552,25 +823,47 @@ async def speech(request: Request):
             logger.exception("Breeze model load failed while serving request")
             raise HTTPException(500, f"Model load failed: {exc}") from exc
         content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type: form = await request.json(); upload = None
+        if "application/json" in content_type:
+            form = await request.json()
+            upload = None
         else:
-            parsed = await request.form(); form = dict(parsed); upload = parsed.get("ref_audio")
+            parsed = await request.form()
+            form = dict(parsed)
+            upload = parsed.get("ref_audio")
         text = str(form.get("input") or form.get("text") or "").strip()
-        if not text: raise HTTPException(422, "input/text is required")
-        instruction = str(form.get("instructions") if form.get("instructions") is not None else form.get("instruction") or "").strip()
-        ref_text = form.get("reference_text") if form.get("reference_text") is not None else form.get("ref_text")
-        ref_text = str(ref_text).strip() if ref_text is not None else None
-        cfg_value = form.get("guidance_scale", form.get("cfg_scale")); voice = str(form.get("voice") or "voice-design")
-        instruction, scale = _normalise_instruction_for_cfg(
-            instruction, cfg_value, fast_enabled=app.state.runtime.fast_enabled
+        if not text:
+            raise HTTPException(422, "input/text is required")
+        instruction = str(
+            form.get("instructions")
+            if form.get("instructions") is not None
+            else form.get("instruction") or ""
+        ).strip()
+        ref_text = (
+            form.get("reference_text")
+            if form.get("reference_text") is not None
+            else form.get("ref_text")
         )
-        ref_request, template_name = _profile_request(app.state.profiles, voice, ref_text=ref_text, instruction=instruction)
+        ref_text = str(ref_text).strip() if ref_text is not None else None
+        cfg_value = form.get("guidance_scale", form.get("cfg_scale"))
+        voice = str(form.get("voice") or "voice-design")
+        instruction, scale = _normalise_instruction_for_cfg(instruction, cfg_value)
+        app.state.metrics[
+            "cfg_no_cfg_requests" if scale == 1.0 else "cfg_guided_requests"
+        ] += 1
+        ref_request, template_name = _profile_request(
+            app.state.profiles, voice, ref_text=ref_text, instruction=instruction
+        )
         if hasattr(upload, "read"):
             data = await _upload_bytes(upload, app.state.cfg.max_ref_audio_bytes)
-            if not ref_text: raise HTTPException(422, "ref_text is required with ref_audio")
-            with tempfile.NamedTemporaryFile(prefix="breeze-ref-", suffix=".wav", delete=False) as handle:
-                handle.write(data or b""); temp_path = Path(handle.name)
-            ref_request.update(ref_audio_path=str(temp_path), ref_text=ref_text); template_name = "ref_edit_tata" if instruction else "ref_clone_tata"
+            if not ref_text:
+                raise HTTPException(422, "ref_text is required with ref_audio")
+            with tempfile.NamedTemporaryFile(
+                prefix="breeze-ref-", suffix=".wav", delete=False
+            ) as handle:
+                handle.write(data or b"")
+                temp_path = Path(handle.name)
+            ref_request.update(ref_audio_path=str(temp_path), ref_text=ref_text)
+            template_name = "ref_edit_tata" if instruction else "ref_clone_tata"
         # Encode any uncached profile or one-off upload exactly once.  Adaptive
         # fit probes and split segments must all reuse identical reference
         # codes rather than repeatedly invoking the codec encoder.
@@ -590,6 +883,7 @@ async def speech(request: Request):
         # request and for any explicit CFG value that otherwise lacks one.
         seed = _parse_seed(form.get("seed", 42))
         set_all_seeds(seed)
+
         def prepare_segment(segment_text: str, segment_index: int = 0):
             segment_request = {
                 **ref_request,
@@ -610,12 +904,8 @@ async def speech(request: Request):
         def segment_fits(segment_text: str, inputs: dict | None = None) -> bool:
             prepared = inputs if inputs is not None else prepare_segment(segment_text)
             prompt_tokens = _prompt_token_count(prepared)
-            available_frames = min(
-                MAX_NEW_TOKENS, MAX_SEQ_LEN - 1 - prompt_tokens
-            )
-            estimated_frames = estimate_speech_frames(
-                app.state.tokenizer, segment_text
-            )
+            available_frames = min(MAX_NEW_TOKENS, MAX_SEQ_LEN - 1 - prompt_tokens)
+            estimated_frames = estimate_speech_frames(app.state.tokenizer, segment_text)
             return estimated_frames + CONTEXT_SAFETY_FRAMES <= available_frames
 
         # Keep native streaming as one generation whenever the actual prompt
@@ -660,15 +950,18 @@ async def speech(request: Request):
             raise HTTPException(422, "Breeze supports response_format=wav or pcm")
         if stream:
             app.state.metrics["streaming_total"] += 1
-            app.state.metrics["streaming_clone" if "ref_text" in ref_request else "streaming_design"] += 1
+            app.state.metrics[
+                "streaming_clone" if "ref_text" in ref_request else "streaming_design"
+            ] += 1
 
             def stream_body() -> Iterator[bytes]:
                 chunk_count = 0
+                pcm_bytes = 0
                 pending: bytes | None = None
                 first_audio_at: float | None = None
+                internal_timings: dict[str, float] = {}
                 try:
-                    active_runtime = getattr(app.state, "eager_runtime", None) if scale == 1.0 else None
-                    active_runtime = active_runtime or app.state.runtime
+                    active_runtime = app.state.runtime
                     for segment_index, inputs in enumerate(inputs_by_segment):
                         segment_request_id = f"{request_id}-{segment_index}"
                         # Breeze sampling can drift noticeably when one long
@@ -696,13 +989,23 @@ async def speech(request: Request):
                                 continue
                             if first_audio_at is None:
                                 first_audio_at = time.perf_counter()
-                                app.state.metrics["ttfa_ms"].append(
-                                    (first_audio_at - started) * 1000
-                                )
+                            pcm_bytes += len(item)
+                            _collect_chunk_timings(internal_timings, chunk)
                             chunk_count += 1
                             if stream_format == "sse":
                                 if pending is not None:
-                                    payload = {"type": "audio.chunk", "data": base64.b64encode(_wav(pending, sample_rate) if response_format == "wav" else pending).decode(), "format": response_format, "sample_rate": sample_rate, "chunk_index": chunk_count - 2, "final": False}
+                                    payload = {
+                                        "type": "audio.chunk",
+                                        "data": base64.b64encode(
+                                            _wav(pending, sample_rate)
+                                            if response_format == "wav"
+                                            else pending
+                                        ).decode(),
+                                        "format": response_format,
+                                        "sample_rate": sample_rate,
+                                        "chunk_index": chunk_count - 2,
+                                        "final": False,
+                                    }
                                     yield (f"data: {json.dumps(payload)}\n\n").encode()
                                 pending = item
                             else:
@@ -717,16 +1020,45 @@ async def speech(request: Request):
                         raise RuntimeError("Breeze produced an empty audio response")
                     if stream_format == "sse":
                         if pending is not None:
-                            payload = {"type": "audio.chunk", "data": base64.b64encode(_wav(pending, sample_rate) if response_format == "wav" else pending).decode(), "format": response_format, "sample_rate": sample_rate, "chunk_index": chunk_count - 1, "final": True}
+                            payload = {
+                                "type": "audio.chunk",
+                                "data": base64.b64encode(
+                                    _wav(pending, sample_rate)
+                                    if response_format == "wav"
+                                    else pending
+                                ).decode(),
+                                "format": response_format,
+                                "sample_rate": sample_rate,
+                                "chunk_index": chunk_count - 1,
+                                "final": True,
+                            }
                             yield (f"data: {json.dumps(payload)}\n\n").encode()
-                        yield (f"data: {json.dumps({'type': 'done', 'chunks': chunk_count, 'request_id': request_id})}\n\n").encode()
+                        yield (
+                            f"data: {json.dumps({'type': 'done', 'chunks': chunk_count, 'request_id': request_id})}\n\n"
+                        ).encode()
                         yield b"data: [DONE]\n\n"
-                    app.state.metrics["requests_success"] += 1
-                    app.state.metrics["latency_ms"].append(
-                        (time.perf_counter() - started) * 1000
+                    _record_successful_request(
+                        request_id=request_id,
+                        started=started,
+                        first_audio_at=first_audio_at,
+                        pcm_bytes=pcm_bytes,
+                        sample_rate=sample_rate,
+                        scale=scale,
+                        streaming=True,
+                        clone="ref_text" in ref_request,
+                        segments=len(inputs_by_segment),
+                        chunks=chunk_count,
+                        internal_timings=internal_timings,
                     )
                 except Exception as exc:
                     app.state.metrics["requests_error"] += 1
+                    _record_failed_request(
+                        request_id=request_id,
+                        started=started,
+                        scale=scale,
+                        streaming=True,
+                        error=exc,
+                    )
                     logger.exception("Breeze streaming synthesis failed")
                     if stream_format == "sse":
                         yield f"data: {json.dumps({'type': 'error', 'error': str(exc), 'message': str(exc)})}\n\n".encode()
@@ -740,12 +1072,19 @@ async def speech(request: Request):
             return StreamingResponse(
                 stream_body(),
                 media_type=media,
-                headers={"Cache-Control": "no-cache", "X-Sample-Rate": str(sample_rate), "X-Audio-Sample-Rate": str(sample_rate), "X-Sample-Format": "s16le", "X-Request-Id": request_id},
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Sample-Rate": str(sample_rate),
+                    "X-Audio-Sample-Rate": str(sample_rate),
+                    "X-Sample-Format": "s16le",
+                    "X-Request-Id": request_id,
+                },
                 background=BackgroundTask(finish_request),
             )
-        active_runtime = getattr(app.state, "eager_runtime", None) if scale == 1.0 else None
-        active_runtime = active_runtime or app.state.runtime
+        active_runtime = app.state.runtime
         chunks = []
+        first_audio_at: float | None = None
+        internal_timings: dict[str, float] = {}
         for segment_index, inputs in enumerate(inputs_by_segment):
             set_all_seeds(seed)
             logger.info(
@@ -763,27 +1102,104 @@ async def speech(request: Request):
             ):
                 item = _pcm16(chunk.audio)
                 if item:
+                    if first_audio_at is None:
+                        first_audio_at = time.perf_counter()
+                    _collect_chunk_timings(internal_timings, chunk)
                     chunks.append(item)
         pcm = b"".join(chunks)
         if not pcm:
             raise RuntimeError("Breeze produced an empty audio response")
-        app.state.metrics["requests_success"] += 1
-        app.state.metrics["latency_ms"].append((time.perf_counter() - started) * 1000)
+        _record_successful_request(
+            request_id=request_id,
+            started=started,
+            first_audio_at=first_audio_at,
+            pcm_bytes=len(pcm),
+            sample_rate=sample_rate,
+            scale=scale,
+            streaming=False,
+            clone="ref_text" in ref_request,
+            segments=len(inputs_by_segment),
+            chunks=len(chunks),
+            internal_timings=internal_timings,
+        )
         output = _wav(pcm, sample_rate) if response_format == "wav" else pcm
-        return Response(output, media_type="audio/wav" if response_format == "wav" else "audio/pcm", headers={"X-Sample-Rate": str(sample_rate), "X-Audio-Sample-Rate": str(sample_rate), "X-Request-Id": request_id})
-    except HTTPException: app.state.metrics["requests_error"] += 1; raise
-    except Exception as exc: app.state.metrics["requests_error"] += 1; raise HTTPException(500, f"Synthesis failed: {exc}") from exc
+        return Response(
+            output,
+            media_type="audio/wav" if response_format == "wav" else "audio/pcm",
+            headers={
+                "X-Sample-Rate": str(sample_rate),
+                "X-Audio-Sample-Rate": str(sample_rate),
+                "X-Request-Id": request_id,
+            },
+        )
+    except HTTPException as exc:
+        app.state.metrics["requests_error"] += 1
+        if "request_id" in locals() and "scale" in locals():
+            _record_failed_request(
+                request_id=request_id,
+                started=started,
+                scale=scale,
+                streaming=False,
+                error=exc,
+            )
+        raise
+    except Exception as exc:
+        app.state.metrics["requests_error"] += 1
+        if "request_id" in locals() and "scale" in locals():
+            _record_failed_request(
+                request_id=request_id,
+                started=started,
+                scale=scale,
+                streaming=False,
+                error=exc,
+            )
+        raise HTTPException(500, f"Synthesis failed: {exc}") from exc
     finally:
         if not locals().get("handoff", False):
             finish_request()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Serve Breeze TTS 2"); parser.add_argument("model", type=Path); parser.add_argument("--weights", type=Path); parser.add_argument("--voice-dir", type=Path, default=ApiSettings.voice_dir); parser.add_argument("--max-ref-audio-mb", type=int, default=25); parser.add_argument("--cors-origins", default=','.join(ApiSettings.cors_origins)); parser.add_argument("--host", default="127.0.0.1"); parser.add_argument("--port", type=int, default=7860)
-    for flag in ("fast-all", "fast-text-encoder", "fast-backbone-prefill", "fast-backbone-decode", "fast-depth-decoder", "fast-codec"): parser.add_argument(f"--{flag}", action=argparse.BooleanOptionalAction, default=None if flag == "fast-all" else False)
-    args = parser.parse_args(); global _settings
-    _settings = ApiSettings(model=args.model, weights=args.weights, voice_dir=args.voice_dir, max_ref_audio_bytes=args.max_ref_audio_mb * 1024 * 1024, cors_origins=tuple(x.strip() for x in args.cors_origins.split(',') if x.strip()), fast_all=args.fast_all, fast_text_encoder=args.fast_text_encoder, fast_backbone_prefill=args.fast_backbone_prefill, fast_backbone_decode=args.fast_backbone_decode, fast_depth_decoder=args.fast_depth_decoder, fast_codec=args.fast_codec)
+    parser = argparse.ArgumentParser(description="Serve Breeze TTS 2")
+    parser.add_argument("model", type=Path)
+    parser.add_argument("--weights", type=Path)
+    parser.add_argument("--voice-dir", type=Path, default=ApiSettings.voice_dir)
+    parser.add_argument("--max-ref-audio-mb", type=int, default=25)
+    parser.add_argument("--cors-origins", default=",".join(ApiSettings.cors_origins))
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=7860)
+    for flag in (
+        "fast-all",
+        "fast-text-encoder",
+        "fast-backbone-prefill",
+        "fast-backbone-decode",
+        "fast-depth-decoder",
+        "fast-codec",
+    ):
+        parser.add_argument(
+            f"--{flag}",
+            action=argparse.BooleanOptionalAction,
+            default=None if flag == "fast-all" else False,
+        )
+    args = parser.parse_args()
+    global _settings
+    _settings = ApiSettings(
+        model=args.model,
+        weights=args.weights,
+        voice_dir=args.voice_dir,
+        max_ref_audio_bytes=args.max_ref_audio_mb * 1024 * 1024,
+        cors_origins=tuple(
+            x.strip() for x in args.cors_origins.split(",") if x.strip()
+        ),
+        fast_all=args.fast_all,
+        fast_text_encoder=args.fast_text_encoder,
+        fast_backbone_prefill=args.fast_backbone_prefill,
+        fast_backbone_decode=args.fast_backbone_decode,
+        fast_depth_decoder=args.fast_depth_decoder,
+        fast_codec=args.fast_codec,
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -24,6 +25,7 @@ from breeze_infer.api import (
     _voice_item,
     app,
     load_model,
+    metrics,
     speech,
     unload_model,
 )
@@ -33,6 +35,7 @@ from breeze_infer.api import (
 from breeze_infer.api import (
     MAX_SEQ_LEN as API_MAX_SEQ_LEN,
 )
+from breeze_infer.observability import new_service_metrics
 from breeze_infer.profiles import ProfileStore
 from infer import MAX_NEW_TOKENS as CLI_MAX_NEW_TOKENS
 from infer import MAX_SEQ_LEN as CLI_MAX_SEQ_LEN
@@ -67,24 +70,23 @@ def _configure_fake_speech_state(monkeypatch, *, runtime_error: bool = False) ->
                 raise RuntimeError(f"failed {request_id}")
             yield SimpleNamespace(audio=np.array([0.25, -0.25], dtype=np.float32))
 
-    app.state.metrics = {
-        "requests_total": 0,
-        "requests_success": 0,
-        "requests_error": 0,
-        "requests_busy": 0,
-        "streaming_total": 0,
-        "streaming_design": 0,
-        "streaming_clone": 0,
-        "ttfa_ms": [],
-        "latency_ms": [],
-    }
+    app.state.metrics = new_service_metrics()
     app.state.profiles = _MissingProfileStore()
     app.state.runtime = _Runtime()
-    app.state.eager_runtime = None
     app.state.tokenizer = _Tokenizer()
     app.state.audio_tokenizer = object()
     app.state.model = object()
-    app.state.cfg = SimpleNamespace(max_ref_audio_bytes=1024)
+    app.state.cfg = SimpleNamespace(
+        max_ref_audio_bytes=1024,
+        weights=None,
+        fast_all=None,
+        fast_text_encoder=False,
+        fast_backbone_prefill=False,
+        fast_backbone_decode=True,
+        fast_depth_decoder=False,
+        fast_codec=False,
+    )
+    app.state.start_time = time.monotonic()
     monkeypatch.setattr(api_module, "set_all_seeds", lambda _seed: None)
     monkeypatch.setattr(
         api_module,
@@ -115,51 +117,36 @@ def test_api_cfg_defaults_to_one() -> None:
 
 
 def test_explicit_cfg_without_direction_uses_neutral_instruction() -> None:
-    instruction, scale = _normalise_instruction_for_cfg(
-        "", "4", fast_enabled=True
-    )
+    instruction, scale = _normalise_instruction_for_cfg("", "4")
 
     assert instruction == DEFAULT_INSTRUCTION
     assert scale == 4.0
 
 
-def test_fast_cfg_one_without_direction_is_promoted_to_fast_default() -> None:
-    instruction, scale = _normalise_instruction_for_cfg(
-        "", "1", fast_enabled=True
-    )
-
-    assert instruction == DEFAULT_INSTRUCTION
-    assert scale == 4.0
-
-
-def test_cfg_one_without_direction_remains_plain_without_fast_profile() -> None:
-    instruction, scale = _normalise_instruction_for_cfg(
-        "", "1", fast_enabled=False
-    )
+def test_cfg_one_without_direction_remains_plain() -> None:
+    instruction, scale = _normalise_instruction_for_cfg("", "1")
 
     assert instruction == ""
     assert scale == 1.0
 
 
-def test_fast_auto_request_uses_neutral_cfg_four_instruction() -> None:
-    instruction, scale = _normalise_instruction_for_cfg(
-        "", "", fast_enabled=True
-    )
+def test_automatic_request_defaults_to_plain_cfg_one() -> None:
+    instruction, scale = _normalise_instruction_for_cfg("", "")
 
-    assert instruction == DEFAULT_INSTRUCTION
-    assert scale == 4.0
+    assert instruction == ""
+    assert scale == 1.0
 
 
 @pytest.mark.parametrize("value", ["bad", object()])
 def test_invalid_cfg_values_return_422(value: object) -> None:
     with pytest.raises(HTTPException) as exc_info:
-        _normalise_instruction_for_cfg("", value, fast_enabled=False)
+        _normalise_instruction_for_cfg("", value)
 
     assert exc_info.value.status_code == 422
 
 
 def test_automatic_cfg_none_remains_supported() -> None:
-    assert _normalise_instruction_for_cfg("", None, fast_enabled=False) == ("", 1.0)
+    assert _normalise_instruction_for_cfg("", None) == ("", 1.0)
 
 
 def test_seed_and_stream_parsing_report_client_errors() -> None:
@@ -187,11 +174,17 @@ def test_prompt_token_count_uses_longest_cfg_branch() -> None:
 def test_expected_torch_compile_warnings_are_quieted() -> None:
     _quiet_expected_torch_compile_warnings()
 
-    assert logging.getLogger("torch.fx.experimental.symbolic_shapes").level == logging.ERROR
+    assert (
+        logging.getLogger("torch.fx.experimental.symbolic_shapes").level
+        == logging.ERROR
+    )
     assert logging.getLogger("torch._inductor.utils").level == logging.ERROR
 
 
 class _MissingProfileStore:
+    def list(self) -> list:
+        return []
+
     def resolve(self, _identifier: str) -> str:
         from breeze_infer.profiles import ProfileNotFoundError
 
@@ -223,9 +216,7 @@ def test_blank_ref_text_uses_stored_profile_transcript(tmp_path) -> None:
     store = ProfileStore(tmp_path)
     store.save("alice", b"reference", "stored transcript")
 
-    request, template = _profile_request(
-        store, "alice", ref_text="   ", instruction=""
-    )
+    request, template = _profile_request(store, "alice", ref_text="   ", instruction="")
 
     assert request["ref_text"] == "stored transcript"
     assert template == "ref_clone_tata"
@@ -258,7 +249,9 @@ def test_model_load_and_unload_endpoints_manage_runtime(monkeypatch) -> None:
 
     _configure_fake_speech_state(monkeypatch)
     assert unload_model() == {
-        "status": "unloaded", "model_loaded": False, "was_loaded": True
+        "status": "unloaded",
+        "model_loaded": False,
+        "was_loaded": True,
     }
     assert app.state.runtime is None
 
@@ -267,7 +260,9 @@ def test_model_load_and_unload_endpoints_manage_runtime(monkeypatch) -> None:
 
     monkeypatch.setattr(api_module, "_load_app", fake_load)
     assert load_model() == {
-        "status": "loaded", "model_loaded": True, "already_loaded": False
+        "status": "loaded",
+        "model_loaded": True,
+        "already_loaded": False,
     }
     assert load_model()["already_loaded"] is True
 
@@ -287,13 +282,57 @@ def test_unloaded_speech_lazily_loads_and_load_errors_are_http_500(monkeypatch) 
     assert response.status_code == 200
 
     app.state.runtime = None
-    monkeypatch.setattr(api_module, "_load_app", lambda *_args: (_ for _ in ()).throw(RuntimeError("GPU unavailable")))
+    monkeypatch.setattr(
+        api_module,
+        "_load_app",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("GPU unavailable")),
+    )
     with pytest.raises(HTTPException, match="Model load failed") as exc_info:
         asyncio.run(speech(_JsonRequest({"input": "hello"})))
     assert exc_info.value.status_code == 500
 
 
-def test_startup_load_failure_keeps_server_idle_for_later_retry(monkeypatch, tmp_path) -> None:
+def test_successful_request_records_bounded_cfg_and_rtf_metrics(monkeypatch) -> None:
+    _configure_fake_speech_state(monkeypatch)
+
+    response = asyncio.run(
+        speech(_JsonRequest({"input": "hello", "guidance_scale": 1}))
+    )
+
+    assert response.status_code == 200
+    assert app.state.metrics["cfg_no_cfg_requests"] == 1
+    assert app.state.metrics["cfg_guided_requests"] == 0
+    assert app.state.metrics["latency_ms"].count == 1
+    assert app.state.metrics["rtf"].count == 1
+    assert app.state.metrics["last_request"]["cfg_mode"] == "no_cfg"
+    assert app.state.metrics["last_request"]["runtime_path"] == "fast"
+
+
+def test_metrics_preserves_legacy_fields_and_adds_structured_data(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    monkeypatch.setattr(
+        api_module,
+        "cuda_snapshot",
+        lambda: {"available": True, "initialized": False},
+    )
+
+    payload = metrics()
+
+    assert payload["requests_total"] == 0
+    assert payload["latency_ms_mean"] == 0.0
+    assert payload["memory_rss_mb"] == payload["process"]["rss_mb"]
+    assert payload["cuda"] == {"available": True, "initialized": False}
+    assert payload["model"]["loaded"] is True
+    assert payload["model"]["fast_stages"]["backbone_decode"] is True
+    assert payload["model_lifecycle"]["load_attempts"] == 0
+    assert payload["inference"]["rtf"]["count"] == 0
+
+
+def test_startup_load_failure_keeps_server_idle_for_later_retry(
+    monkeypatch, tmp_path
+) -> None:
     import breeze_infer.api as api_module
 
     monkeypatch.setattr(api_module, "_settings", SimpleNamespace(voice_dir=tmp_path))
@@ -315,9 +354,7 @@ def test_abandoned_stream_background_releases_inference_lock(monkeypatch) -> Non
     import breeze_infer.api as api_module
 
     _configure_fake_speech_state(monkeypatch)
-    response = asyncio.run(
-        speech(_JsonRequest({"input": "hello", "stream": True}))
-    )
+    response = asyncio.run(speech(_JsonRequest({"input": "hello", "stream": True})))
     assert api_module._request_lock.locked()
 
     asyncio.run(response.background())
@@ -329,9 +366,7 @@ def test_raw_stream_runtime_failure_is_not_reported_as_success(monkeypatch) -> N
     import breeze_infer.api as api_module
 
     _configure_fake_speech_state(monkeypatch, runtime_error=True)
-    response = asyncio.run(
-        speech(_JsonRequest({"input": "hello", "stream": True}))
-    )
+    response = asyncio.run(speech(_JsonRequest({"input": "hello", "stream": True})))
 
     async def consume() -> None:
         async for _chunk in response.body_iterator:
