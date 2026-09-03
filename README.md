@@ -176,7 +176,8 @@ default the container expects:
 
 ```text
 /models/Breeze-TTS-2/
-/models/Breeze-TTS-2-int8-hybrid.safetensors
+  Breeze-TTS-2-int8-hybrid.safetensors
+  config.json, tokenizer files, and audio_tokenizer/
 ```
 
 The runtime paths can be changed with Docker environment variables:
@@ -184,7 +185,7 @@ The runtime paths can be changed with Docker environment variables:
 ```text
 BREEZE_MODEL_ROOT=/models
 BREEZE_MODEL_DIR=/models/Breeze-TTS-2
-BREEZE_WEIGHTS_FILE=Breeze-TTS-2-int8-hybrid.safetensors
+BREEZE_WEIGHTS_FILE=Breeze-TTS-2-int8-hybrid.safetensors  # inside BREEZE_MODEL_DIR
 BREEZE_WEIGHTS_PATH=/models/custom-weights.safetensors  # overrides filename
 BREEZE_PROFILE_DIR=/data/profiles
 ```

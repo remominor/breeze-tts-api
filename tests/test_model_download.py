@@ -12,7 +12,7 @@ from breeze_infer.model_download import (
 
 def test_complete_model_layout_does_not_download(tmp_path, monkeypatch) -> None:
     model_dir = tmp_path / "models" / "Breeze-TTS-2"
-    weights = model_dir.parent / HYBRID_WEIGHTS_FILE
+    weights = model_dir / HYBRID_WEIGHTS_FILE
     for filename in MODEL_SIDECARS:
         path = model_dir / filename
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -29,7 +29,7 @@ def test_complete_model_layout_does_not_download(tmp_path, monkeypatch) -> None:
 
 def test_missing_default_assets_download_to_api_layout(tmp_path, monkeypatch) -> None:
     model_dir = tmp_path / "models" / "Breeze-TTS-2"
-    weights = model_dir.parent / HYBRID_WEIGHTS_FILE
+    weights = model_dir / HYBRID_WEIGHTS_FILE
     calls: list[dict[str, str]] = []
 
     def fake_download(*, repo_id: str, filename: str, local_dir: str, **_kwargs):

@@ -112,7 +112,8 @@ COPY . .
 # At runtime mount one host directory at /models containing:
 #
 #   /models/Breeze-TTS-2/
-#   /models/Breeze-TTS-2-int8-hybrid.safetensors
+#     Breeze-TTS-2-int8-hybrid.safetensors
+#     config.json, tokenizer files, and audio_tokenizer/
 #
 # Mount a second host directory at /data/profiles for persistent uploaded
 # profiles, matching the OmniVoice deployment layout.

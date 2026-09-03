@@ -23,9 +23,9 @@ MODEL_SIDECARS = (
 def ensure_hybrid_assets(model_dir: Path, weights_path: Path) -> Path:
     """Download missing hybrid serving files from the ComfyUI mirror.
 
-    The API intentionally keeps the hybrid checkpoint beside the model folder,
-    while the mirror stores it with the sidecar files. Individual downloads
-    preserve the API's existing ``models/Breeze-TTS-2`` layout.
+    Individual downloads preserve the single-directory API layout used by the
+    mirror: ``models/Breeze-TTS-2`` contains both sidecars and the hybrid
+    checkpoint.
     """
     model_dir = model_dir.resolve()
     weights_path = weights_path.resolve()
