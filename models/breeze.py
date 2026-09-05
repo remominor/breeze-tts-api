@@ -915,17 +915,32 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
 
     def __init__(self, config):
         super().__init__(config)
+        # The standalone API supplies an external Qwen audio tokenizer and
+        # always uses the configured text encoder. It marks the live config
+        # with this private flag before construction so the legacy fallback
+        # modules do not consume GPU residency. Generic/training loads retain
+        # the default and remain fully compatible.
+        load_unused_modules = not bool(
+            getattr(config, "_omit_service_unused_modules", False)
+        )
         self.vocab_size = config.vocab_size
         # Extra backbone EOS class at index vocab_size; audio codebook ids remain [0, vocab_size).
         self.backbone_eos_token_id = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size + 1, bias=False)
 
-        # embed_text_tokens needs to include audio special tokens (audio_token_id, audio_eos_token_id)
-        # since they appear in input_ids before being replaced with audio embeddings
-        # text_vocab_size already includes these tokens after tokenizer extension
-        self.embed_text_tokens = nn.Embedding(
-            config.text_vocab_size, config.hidden_size
-        )
+        # This is only the fallback for configurations without a text encoder.
+        # The standalone service always uses the T5Gemma text encoder, so avoid
+        # materializing this 1 GiB checkpoint tensor in its lean load path.
+        has_text_encoder = getattr(config, "text_encoder_config", None) is not None
+        if load_unused_modules or not has_text_encoder:
+            # embed_text_tokens needs to include audio special tokens
+            # (audio_token_id, audio_eos_token_id) since they appear in
+            # input_ids before being replaced with audio embeddings.
+            self.embed_text_tokens = nn.Embedding(
+                config.text_vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_text_tokens = None
 
         # Use factory to create backbone (supports breeze/qwen3/llama etc.)
         from .breeze_backbone_factory import BreezeBackboneFactory
@@ -936,11 +951,16 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
             config.depth_decoder_config
         )
 
-        self.codec_model = AutoModel.from_config(config.codec_config)
-        # Codec model is always in eval mode (not trainable)
-        self.codec_model.eval()
-        for param in self.codec_model.parameters():
-            param.requires_grad = False
+        if load_unused_modules:
+            self.codec_model = AutoModel.from_config(config.codec_config)
+            # Codec model is always in eval mode (not trainable)
+            self.codec_model.eval()
+            for param in self.codec_model.parameters():
+                param.requires_grad = False
+        else:
+            # The service uses qwen_tts.Qwen3TTSTokenizer instead.  Retain the
+            # attribute so unsupported legacy paths fail with a clear error.
+            self.codec_model = None
 
         self.text_encoder_trainable = False
         text_encoder_config = getattr(config, "text_encoder_config", None)
@@ -1135,7 +1155,8 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
         """Override train() to keep non-trainable submodules in eval mode."""
         super().train(mode)
         # Always keep codec_model in eval mode
-        self.codec_model.eval()
+        if self.codec_model is not None:
+            self.codec_model.eval()
         if getattr(self, "text_encoder", None) is not None and not getattr(
             self, "text_encoder_trainable", False
         ):
@@ -1442,7 +1463,7 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
             text_embeds = torch.empty(
                 (0, self.config.hidden_size),
                 device=input_ids.device,
-                dtype=self.embed_text_tokens.weight.dtype,
+                dtype=self.backbone_model.embed_tokens.embed_audio_tokens.weight.dtype,
             )
             text_encoder_layer_hidden_states = None
 
@@ -1573,6 +1594,11 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
                 )
             )
         else:
+            if self.embed_text_tokens is None:
+                raise RuntimeError(
+                    "This lean Breeze model requires its configured text encoder; "
+                    "the fallback text embedding was not loaded."
+                )
             inputs_embeds = self.embed_text_tokens(input_ids)
 
         if input_values is not None:
@@ -1662,6 +1688,11 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
         }
 
     def _get_audio_token_from_batch(self, audio_batch):
+        if self.codec_model is None:
+            raise RuntimeError(
+                "This lean Breeze model has no embedded Mimi codec. Supply "
+                "pre-encoded input_values or use the external audio tokenizer."
+            )
         with torch.no_grad():
             print("Encoding audio batch of shape:", audio_batch.shape)
             codec_outputs = self.codec_model.encode(audio_batch.unsqueeze(0))

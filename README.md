@@ -18,6 +18,8 @@ paths, and explicit GPU model load/unload controls.
 
 - `POST /v1/audio/speech` for voice design, cloning, and direction.
 - Hybrid INT8 ConvRot backbone/text encoder with BF16 depth decoder.
+- Lean service loader omits the checkpoint's unused legacy Mimi codec and
+  fallback text embedding, saving roughly 1.2 GiB of model VRAM.
 - Automatic download of missing default model assets from
   [`drbaph/Breeze-TTS-2-comfyui`](https://huggingface.co/drbaph/Breeze-TTS-2-comfyui).
 - 24 kHz mono PCM streaming or SSE audio chunks.
@@ -242,6 +244,16 @@ there is enough VRAM:
 
 Fast modes warm CUDA graphs before serving and are single-concurrency by
 design. Use eager stages when debugging or conserving VRAM.
+
+### Intentional context budget
+
+The server deliberately keeps `MAX_SEQ_LEN=2048`. Reducing it saves static
+backbone KV-cache VRAM, but testing showed that the resulting sentence
+splitting harms voice and delivery consistency: Breeze performs best when a
+long passage is generated in one streaming session with unchanged conditioning.
+Keep the 2048-token budget for quality unless a deployment explicitly accepts
+that trade-off. The lean loader above should be exhausted before lowering this
+limit.
 
 ## Development
 

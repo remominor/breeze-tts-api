@@ -97,6 +97,19 @@ def _load_breeze_tokenizer(ckpt_dir: Path) -> AutoTokenizer:
         return tokenizer
 
 
+@contextmanager
+def _suppress_accelerate_checkpoint_progress():
+    """Keep the service's one-time checkpoint load out of its API logs."""
+    import accelerate.utils.modeling as accelerate_modeling
+
+    original = accelerate_modeling.is_tqdm_available
+    accelerate_modeling.is_tqdm_available = lambda: False
+    try:
+        yield
+    finally:
+        accelerate_modeling.is_tqdm_available = original
+
+
 def get_dist_info() -> tuple[int, int, int]:
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -174,14 +187,17 @@ def load_runtime(
             ) from exc
     tokenizer = _load_breeze_tokenizer(ckpt_dir)
     if weights_path is None:
+        config = BreezeConfig.from_pretrained(ckpt_dir)
+        config._omit_service_unused_modules = True
         model = BreezeForConditionalGeneration.from_pretrained(
             ckpt_dir,
+            config=config,
             dtype=torch.bfloat16,
             attn_implementation=attn_implementation,
         )
         model.to(device)
     else:
-        from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+        from accelerate import init_empty_weights, load_checkpoint_in_model
 
         from breeze_infer.int8_convrot import (
             model_quantization_stats,
@@ -199,6 +215,7 @@ def load_runtime(
         if not quant_map:
             raise RuntimeError(f"Weights file has no ConvRot quantization metadata: {weights_path}")
         config = BreezeConfig.from_pretrained(ckpt_dir)
+        config._omit_service_unused_modules = True
         with init_empty_weights():
             model = BreezeForConditionalGeneration(config)
         # The checkpoint omits the tied audio embedding duplicate.  Establish
@@ -208,11 +225,35 @@ def load_runtime(
         replaced = replace_quantized_linears(model, quant_map)
         if len(replaced) != len(quant_map):
             raise RuntimeError(f"Only {len(replaced)}/{len(quant_map)} quantized prefixes matched")
-        with _suppress_hybrid_quant_notice():
-            model = load_checkpoint_and_dispatch(
-                model, str(weights_path), device_map={"": device}, dtype=torch.bfloat16,
+        # Accelerate otherwise maps every safetensors entry directly to CUDA
+        # before noticing that the lean model has no matching parameter. Keep
+        # those intentionally omitted tensors on CPU during staging so its
+        # caching allocator does not retain their 1.2 GiB GPU allocation.
+        # Do not include a catch-all CUDA mapping: Accelerate would then map
+        # the omitted checkpoint entries to both CUDA and CPU while staging.
+        # Unmapped entries fall back to CPU; every module retained by the lean
+        # model is named here and is loaded directly to the target GPU.
+        staging_device_map = {
+            "backbone_model": device,
+            "depth_decoder": device,
+            "text_encoder": device,
+            "text_encoder_proj": device,
+            "lm_head": device,
+            # Retain an explicit CPU entry so Accelerate takes its per-prefix
+            # safetensors path instead of its one-device shortcut, which would
+            # stage every checkpoint tensor on CUDA.
+            "codec_model": "cpu",
+        }
+        with _suppress_hybrid_quant_notice(), _suppress_accelerate_checkpoint_progress():
+            load_checkpoint_in_model(
+                model, str(weights_path), device_map=staging_device_map, dtype=torch.bfloat16,
                 strict=False, full_state_dict=True,
             )
+        # ``load_checkpoint_in_model`` places checkpoint tensors but does not
+        # dispatch non-persistent constructor buffers (RoPE frequencies and
+        # audio token offsets). Move those small buffers with the model before
+        # CUDA-graph warmup.
+        model.to(device)
         # ConvRot scales are consumed as FP32 by comfy-kitchen.  The dispatch
         # dtype policy above intentionally materializes ordinary model weights
         # as BF16, so restore this quantization metadata dtype explicitly.
