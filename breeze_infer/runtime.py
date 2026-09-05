@@ -77,24 +77,10 @@ def _suppress_hybrid_quant_notice():
 
 
 def _load_breeze_tokenizer(ckpt_dir: Path) -> AutoTokenizer:
-    try:
-        return AutoTokenizer.from_pretrained(ckpt_dir, fix_mistral_regex=True)
-    except TypeError as exc:
-        # transformers 4.57.3 assumes tokenizers exposes a mutable pre-tokenizer
-        # sequence, while tokenizers 0.22 exposes the single Split directly.
-        if "does not support item assignment" not in str(exc):
-            raise
-        tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, fix_mistral_regex=False)
-        import tokenizers
-
-        tokenizer.backend_tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Split(
-            pattern=tokenizers.Regex(
-                r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-            ),
-            behavior="isolated",
-        )
-        tokenizer.fix_mistral_regex = True
-        return tokenizer
+    # Breeze uses GemmaTokenizerFast, not a Mistral tokenizer.  Transformers'
+    # Mistral-only regex migration is therefore inapplicable and, with the
+    # tokenizers version in our supported stack, can raise a TypeError.
+    return AutoTokenizer.from_pretrained(ckpt_dir, fix_mistral_regex=False)
 
 
 @contextmanager

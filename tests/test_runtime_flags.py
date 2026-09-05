@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
+from breeze_infer.runtime import _load_breeze_tokenizer
 from models.fast_streaming import FastBreezeStreamingRuntime
 
 
@@ -20,3 +23,13 @@ def test_runtime_fast_properties_return_values_not_methods() -> None:
 
     assert runtime.fast_enabled is True
     assert runtime.codec_chunk_frames == 1
+
+
+def test_breeze_tokenizer_disables_inapplicable_mistral_regex_fix(tmp_path) -> None:
+    tokenizer = object()
+    with patch(
+        "breeze_infer.runtime.AutoTokenizer.from_pretrained", return_value=tokenizer
+    ) as load_tokenizer:
+        assert _load_breeze_tokenizer(tmp_path) is tokenizer
+
+    load_tokenizer.assert_called_once_with(tmp_path, fix_mistral_regex=False)

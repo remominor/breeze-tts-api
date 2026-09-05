@@ -46,7 +46,7 @@ def test_bundled_config_covers_no_cfg_and_guided_fast_paths() -> None:
         if graph.batch_size == 4
     ]
     # ref_edit_tata merges the two positive and two negative text segments.
-    assert voice_direction_text_lengths == [64, 96, 128]
+    assert voice_direction_text_lengths == [32, 64, 96, 128, 160, 256]
 
 
 def test_config_requires_decode_graph_for_each_cfg_shape() -> None:
