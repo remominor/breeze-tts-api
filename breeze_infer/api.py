@@ -1468,6 +1468,15 @@ async def continuation_speech(request: Request):
         else:
             managed = app.state.continuations.continue_session(continuation_id)
 
+        prepared_text_inputs = None
+        if operation == "continue":
+            prepared_text_inputs = app.state.continuations.runtime.preflight_continue(
+                managed.runtime_state,
+                text,
+                estimated_audio_frames=estimated_frames,
+                context_safety_frames=CONTEXT_SAFETY_FRAMES,
+            )
+
         request_id = f"continuation-api-{uuid.uuid4().hex}"
         chunk_index = managed.runtime_state.chunk_index
 
@@ -1487,6 +1496,7 @@ async def continuation_speech(request: Request):
                 estimated_audio_frames=estimated_frames,
                 context_safety_frames=CONTEXT_SAFETY_FRAMES,
                 cancel_event=cancel_event,
+                prepared_text_inputs=prepared_text_inputs,
             )
 
         def record_success(
@@ -1536,10 +1546,11 @@ async def continuation_speech(request: Request):
                 sentinel = object()
 
                 async def watch_disconnect() -> None:
-                    nonlocal disconnected
+                    nonlocal disconnected, failure_status
                     while not cancel_event.is_set():
                         if await request.is_disconnected():
                             disconnected = True
+                            failure_status = "cancelled"
                             cancel_event.set()
                             return
                         await asyncio.sleep(0.05)
@@ -1554,6 +1565,7 @@ async def continuation_speech(request: Request):
                         try:
                             chunk = await asyncio.shield(next_chunk)
                         except asyncio.CancelledError:
+                            failure_status = "cancelled"
                             cancel_event.set()
                             with suppress(asyncio.CancelledError):
                                 await asyncio.shield(next_chunk)
@@ -1588,6 +1600,9 @@ async def continuation_speech(request: Request):
                         if disconnected:
                             failure_status = "cancelled"
                             return
+                    if disconnected:
+                        failure_status = "cancelled"
+                        return
                     if chunk_count == 0:
                         raise RuntimeError("Breeze produced an empty audio response")
                     if stream_format == "sse":
@@ -1607,6 +1622,9 @@ async def continuation_speech(request: Request):
                             yield f"data: {json.dumps(payload)}\n\n".encode()
                         yield f"data: {json.dumps({'type': 'done', 'chunks': chunk_count, 'request_id': request_id})}\n\n".encode()
                         yield b"data: [DONE]\n\n"
+                    if disconnected:
+                        failure_status = "cancelled"
+                        return
                     record_success(
                         pcm_bytes=pcm_bytes,
                         first_audio_at=first_audio_at,

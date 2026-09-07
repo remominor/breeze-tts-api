@@ -204,6 +204,35 @@ class ContinuationStreamingRuntime:
         embed = session.graph.embed_tokens(frame).to(self.runtime.dtype)
         return embed.repeat(session.branch_batch_size, 1, 1)
 
+    def preflight_continue(
+        self,
+        session: ContinuationRuntimeSession,
+        text: str,
+        *,
+        estimated_audio_frames: int = 0,
+        context_safety_frames: int = 64,
+    ) -> dict[str, torch.Tensor | None]:
+        """Tokenize and validate an append before HTTP response headers commit."""
+        self._check_open(session)
+        text_inputs = prepare_continuation_text_inputs(
+            self.runtime.tokenizer,
+            self.runtime.audio_tokenizer,
+            self.runtime.model,
+            text,
+        )
+        append_len = int(text_inputs["input_ids"].shape[1]) + int(self.audio_eos)
+        required = (
+            session.cache_length
+            + append_len
+            + int(estimated_audio_frames)
+            + int(context_safety_frames)
+        )
+        if required >= self.runtime.config.max_seq_len:
+            raise ContinuationContextError(
+                "continuation context limit exceeded while appending text"
+            )
+        return text_inputs
+
     @torch.inference_mode()
     def append_text(
         self,
@@ -212,17 +241,18 @@ class ContinuationStreamingRuntime:
         *,
         estimated_audio_frames: int = 0,
         context_safety_frames: int = 64,
+        prepared_text_inputs: dict[str, torch.Tensor | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float | int]]:
         self._check_open(session)
         if session.next_position_ids is None or session.pad_lens is None:
             raise ContinuationRuntimeError("continuation has not completed initial prefill")
 
         text_started = time.perf_counter()
-        text_inputs = prepare_continuation_text_inputs(
-            self.runtime.tokenizer,
-            self.runtime.audio_tokenizer,
-            self.runtime.model,
+        text_inputs = prepared_text_inputs or self.preflight_continue(
+            session,
             text,
+            estimated_audio_frames=estimated_audio_frames,
+            context_safety_frames=context_safety_frames,
         )
         text_embeds, _ = self.runtime._merge_branch(
             input_ids=text_inputs["input_ids"],
@@ -497,6 +527,7 @@ class ContinuationStreamingRuntime:
         estimated_audio_frames: int = 0,
         context_safety_frames: int = 64,
         cancel_event: threading.Event | None = None,
+        prepared_text_inputs: dict[str, torch.Tensor | None] | None = None,
     ) -> Iterator[FastStreamingChunk]:
         self._check_open(session)
         if session.rng_state is None:
@@ -508,6 +539,7 @@ class ContinuationStreamingRuntime:
             text,
             estimated_audio_frames=estimated_audio_frames,
             context_safety_frames=context_safety_frames,
+            prepared_text_inputs=prepared_text_inputs,
         )
         yield from self._generate(
             session,

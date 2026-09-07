@@ -27,6 +27,13 @@ class _Request:
         return False
 
 
+class _DisconnectRequest(_Request):
+    disconnected = False
+
+    async def is_disconnected(self) -> bool:
+        return self.disconnected
+
+
 class _Profiles:
     def resolve(self, _identifier):
         from breeze_infer.profiles import ProfileNotFoundError
@@ -58,7 +65,15 @@ class _ContinuationRuntime:
             last_timing={},
             last_used_at=time.monotonic(),
             closed=False,
+            cache_length=8,
         )
+
+    def preflight_continue(self, _state, text, **_kwargs):
+        if text == "too long":
+            from models.continuation_streaming import ContinuationContextError
+
+            raise ContinuationContextError("continuation context limit exceeded")
+        return {"prepared": True}
 
     def _chunks(self, state, operation):
         yield SimpleNamespace(audio=np.array([0.25, -0.25], dtype=np.float32))
@@ -227,3 +242,38 @@ def test_stream_releases_request_lock_but_retains_session() -> None:
     assert not api_module._request_lock.locked()
     assert app.state.continuations.session is not None
     assert app.state.continuations.session.in_flight is False
+
+
+def test_stream_disconnect_after_audio_invalidates_session(configured) -> None:
+    request = _DisconnectRequest(_payload(stream=True, response_format="pcm"))
+    response = asyncio.run(continuation_speech(request))
+
+    async def consume_until_disconnect() -> bytes:
+        first = await anext(response.body_iterator)
+        request.disconnected = True
+        await asyncio.sleep(0.06)
+        with pytest.raises(StopAsyncIteration):
+            await anext(response.body_iterator)
+        return first
+
+    assert asyncio.run(consume_until_disconnect())
+    asyncio.run(response.background())
+
+    assert configured.closed == ["one"]
+    assert app.state.continuations.session is None
+    assert app.state.metrics["continuation"]["sessions_cancelled"] == 1
+    assert app.state.metrics["continuation"]["sessions_completed"] == 0
+    assert not api_module._request_lock.locked()
+
+
+def test_stream_followup_context_error_is_409_before_response(configured) -> None:
+    asyncio.run(continuation_speech(_Request(_payload())))
+
+    with pytest.raises(HTTPException, match="context limit") as exc_info:
+        asyncio.run(
+            continuation_speech(_Request(_payload(input="too long", stream=True)))
+        )
+
+    assert exc_info.value.status_code == 409
+    assert configured.closed == ["one"]
+    assert app.state.continuations.session is None

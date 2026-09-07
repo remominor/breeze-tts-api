@@ -147,6 +147,31 @@ def test_append_rejects_context_before_writing_kv(monkeypatch) -> None:
     assert state.cache_length == 12
 
 
+def test_preflight_rejects_context_without_running_text_encoder(monkeypatch) -> None:
+    runtime = _Runtime()
+    graph = _Graph()
+    continuation = ContinuationStreamingRuntime(runtime, audio_eos=True)
+    state = _session(graph)
+    state.cache_length = 11
+    monkeypatch.setattr(
+        continuation_module,
+        "prepare_continuation_text_inputs",
+        lambda *_args, **_kwargs: {
+            "input_ids": torch.ones(1, 2, dtype=torch.long),
+            "attention_mask": torch.ones(1, 2, dtype=torch.long),
+            "text_ids_mask": torch.ones(1, 2, dtype=torch.bool),
+            "text_ids_len": torch.tensor([2]),
+        },
+    )
+
+    with pytest.raises(ContinuationContextError, match="context limit"):
+        continuation.preflight_continue(
+            state, "new text", estimated_audio_frames=1, context_safety_frames=1
+        )
+
+    assert graph.calls == []
+
+
 def test_codec_lifetime_spans_logical_requests_and_closes_once() -> None:
     runtime = _Runtime()
     graph = _Graph()
