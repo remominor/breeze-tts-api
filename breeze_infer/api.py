@@ -888,6 +888,17 @@ def _record_failed_request(
 @app.post("/v1/audio/speech")
 @app.post("/v1/audio/speech/clone")
 async def speech(request: Request):
+    # Keep the production speech path intact unless the client explicitly opts
+    # into retained causal state. Request body access is cached by Starlette,
+    # so continuation_speech can parse the same JSON/form payload afterwards.
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        continuation_form = await request.json()
+    else:
+        continuation_form = await request.form()
+    if str(continuation_form.get("continuation_id") or "").strip():
+        return await continuation_speech(request)
+
     app.state.metrics["requests_total"] += 1
     if not _request_lock.acquire(blocking=False):
         app.state.metrics["requests_busy"] += 1

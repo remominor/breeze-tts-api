@@ -179,10 +179,12 @@ the `X-Sample-Rate: 24000` and `X-Sample-Format: s16le` headers. Set
 
 ### Experimental stateful continuation
 
-`POST /v1/audio/speech/continuation` keeps the Breeze backbone, CFG, RNG,
-repetition, and streaming-codec state between complete HTTP requests. The
-client still decides sentence/clause boundaries and sends only one request at
-a time; the server does not accept streamed text and does not queue inference.
+Pass `continuation_id` to `POST /v1/audio/speech` to keep the Breeze backbone,
+CFG, RNG, repetition, and streaming-codec state between complete HTTP
+requests. `POST /v1/audio/speech/continuation` is an equivalent explicit alias.
+The client still decides sentence/clause boundaries and sends only one request
+at a time; the server does not accept streamed text and does not queue
+inference.
 
 Send a client-generated `continuation_id` with every chunk. The first request
 for an ID starts a trajectory and later requests with the same effective
@@ -195,7 +197,7 @@ for text in \
   "There is one thing we should test first." \
   "After that, we should know whether it is worth pursuing."
 do
-  curl -sS http://127.0.0.1:7860/v1/audio/speech/continuation \
+  curl -sS http://127.0.0.1:7860/v1/audio/speech \
     -H 'Content-Type: application/json' \
     -d "$(jq -n --arg text "$text" '{
       input: $text,

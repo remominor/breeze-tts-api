@@ -146,6 +146,15 @@ def test_id_implicitly_starts_then_continues(configured) -> None:
     assert configured.closed == []
 
 
+def test_standard_speech_endpoint_dispatches_continuation_id(configured) -> None:
+    first = asyncio.run(speech(_Request(_payload())))
+    second = asyncio.run(speech(_Request(_payload(input="again"))))
+
+    assert first.headers["x-continuation-chunk-index"] == "0"
+    assert second.headers["x-continuation-chunk-index"] == "1"
+    assert app.state.continuations.session.successful_chunks == 2
+
+
 def test_different_id_replaces_idle_session(configured) -> None:
     asyncio.run(continuation_speech(_Request(_payload("one"))))
     response = asyncio.run(continuation_speech(_Request(_payload("two"))))
