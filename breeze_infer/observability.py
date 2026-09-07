@@ -51,6 +51,7 @@ def new_service_metrics() -> dict[str, Any]:
         "streaming_total": 0,
         "streaming_design": 0,
         "streaming_clone": 0,
+        "streaming_cancelled": 0,
         "cfg_no_cfg_requests": 0,
         "cfg_guided_requests": 0,
         "model_load_attempts": 0,

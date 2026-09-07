@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -753,7 +754,13 @@ class FastBreezeStreamingRuntime:
         *,
         request_id: str | None = None,
         seed: int | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> Iterator[FastStreamingChunk]:
+        """Yield audio chunks, stopping promptly when ``cancel_event`` is set.
+
+        Cancellation is cooperative: an already-running CUDA operation must
+        finish, but no further generation frames are scheduled.
+        """
         cfg = select_fast_cfg(inputs)
         branch_batch_size = 2 if cfg.mode == "single_cfg" else 1
         self._ensure_graphs(branch_batch_size, cfg.guidance_scale)
@@ -792,6 +799,8 @@ class FastBreezeStreamingRuntime:
             prefill_start_event.record()
 
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             attention_mask = branch.attention_mask
             if self._fast_backbone_prefill:
                 if self._backbone_prefill_graph is None:
@@ -843,6 +852,9 @@ class FastBreezeStreamingRuntime:
                 prefill_end_event.record()
 
             for step_idx in range(self.config.max_new_tokens):
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.info("Breeze generation cancelled: request_id=%s", request_id)
+                    return
                 if is_backbone_eos_token(token, self.model.config):
                     break
 

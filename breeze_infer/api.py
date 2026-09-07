@@ -12,8 +12,8 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Iterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.request import urlopen
@@ -954,12 +954,28 @@ async def speech(request: Request):
                 "streaming_clone" if "ref_text" in ref_request else "streaming_design"
             ] += 1
 
-            def stream_body() -> Iterator[bytes]:
+            async def stream_body() -> AsyncIterator[bytes]:
                 chunk_count = 0
                 pcm_bytes = 0
                 pending: bytes | None = None
                 first_audio_at: float | None = None
                 internal_timings: dict[str, float] = {}
+                cancel_event = threading.Event()
+                sentinel = object()
+
+                async def watch_disconnect() -> None:
+                    while not cancel_event.is_set():
+                        if await request.is_disconnected():
+                            cancel_event.set()
+                            logger.info(
+                                "Breeze client disconnected; cancelling generation: "
+                                "request_id=%s",
+                                request_id,
+                            )
+                            return
+                        await asyncio.sleep(0.05)
+
+                disconnect_watcher = asyncio.create_task(watch_disconnect())
                 try:
                     active_runtime = app.state.runtime
                     for segment_index, inputs in enumerate(inputs_by_segment):
@@ -981,41 +997,71 @@ async def speech(request: Request):
                             ref_request.get("profile_id"),
                             "ref_audio_codes" in ref_request,
                         )
-                        for chunk in active_runtime.iter_audio_chunks(
-                            inputs, request_id=segment_request_id, seed=seed
-                        ):
-                            item = _pcm16(chunk.audio)
-                            if not item:
-                                continue
-                            if first_audio_at is None:
-                                first_audio_at = time.perf_counter()
-                            pcm_bytes += len(item)
-                            _collect_chunk_timings(internal_timings, chunk)
-                            chunk_count += 1
-                            if stream_format == "sse":
-                                if pending is not None:
-                                    payload = {
-                                        "type": "audio.chunk",
-                                        "data": base64.b64encode(
-                                            _wav(pending, sample_rate)
-                                            if response_format == "wav"
-                                            else pending
-                                        ).decode(),
-                                        "format": response_format,
-                                        "sample_rate": sample_rate,
-                                        "chunk_index": chunk_count - 2,
-                                        "final": False,
-                                    }
-                                    yield (f"data: {json.dumps(payload)}\n\n").encode()
-                                pending = item
-                            else:
-                                # A RIFF/WAV header carries a final data
-                                # length that is unknown while streaming.  A
-                                # header for only the first chunk makes strict
-                                # players truncate the rest of the response.
-                                # Raw PCM is the compatible streaming format;
-                                # the sample-rate headers describe it.
-                                yield item
+                        chunk_iterator = active_runtime.iter_audio_chunks(
+                            inputs,
+                            request_id=segment_request_id,
+                            seed=seed,
+                            cancel_event=cancel_event,
+                        )
+                        try:
+                            while not cancel_event.is_set():
+                                next_chunk = asyncio.create_task(
+                                    asyncio.to_thread(next, chunk_iterator, sentinel)
+                                )
+                                try:
+                                    chunk = await asyncio.shield(next_chunk)
+                                except asyncio.CancelledError:
+                                    # Starlette cancels the response task on a
+                                    # disconnect. Let the worker finish the
+                                    # current CUDA call and observe this event.
+                                    cancel_event.set()
+                                    with suppress(asyncio.CancelledError):
+                                        await asyncio.shield(next_chunk)
+                                    raise
+                                if chunk is sentinel:
+                                    break
+                                if cancel_event.is_set():
+                                    break
+                                item = _pcm16(chunk.audio)
+                                if not item:
+                                    continue
+                                if first_audio_at is None:
+                                    first_audio_at = time.perf_counter()
+                                pcm_bytes += len(item)
+                                _collect_chunk_timings(internal_timings, chunk)
+                                chunk_count += 1
+                                if stream_format == "sse":
+                                    if pending is not None:
+                                        payload = {
+                                            "type": "audio.chunk",
+                                            "data": base64.b64encode(
+                                                _wav(pending, sample_rate)
+                                                if response_format == "wav"
+                                                else pending
+                                            ).decode(),
+                                            "format": response_format,
+                                            "sample_rate": sample_rate,
+                                            "chunk_index": chunk_count - 2,
+                                            "final": False,
+                                        }
+                                        yield (f"data: {json.dumps(payload)}\n\n").encode()
+                                    pending = item
+                                else:
+                                    # A RIFF/WAV header carries a final data
+                                    # length that is unknown while streaming. A
+                                    # header for only the first chunk makes strict
+                                    # players truncate the rest of the response.
+                                    # Raw PCM is the compatible streaming format;
+                                    # the sample-rate headers describe it.
+                                    yield item
+                        finally:
+                            # A completed synchronous generator runs its
+                            # cleanup (including codec request teardown).
+                            if cancel_event.is_set():
+                                chunk_iterator.close()
+                        if cancel_event.is_set():
+                            app.state.metrics["streaming_cancelled"] += 1
+                            return
                     if chunk_count == 0:
                         raise RuntimeError("Breeze produced an empty audio response")
                     if stream_format == "sse":
@@ -1065,6 +1111,10 @@ async def speech(request: Request):
                     else:
                         raise
                 finally:
+                    cancel_event.set()
+                    disconnect_watcher.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await disconnect_watcher
                     finish_request()
 
             media = "text/event-stream" if stream_format == "sse" else "audio/pcm"
