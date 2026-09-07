@@ -65,6 +65,20 @@ def new_service_metrics() -> dict[str, Any]:
         "model_load_ms": RunningStats(),
         "model_unload_ms": RunningStats(),
         "last_request": None,
+        "continuation": {
+            "sessions_started": 0,
+            "sessions_completed": 0,
+            "sessions_cancelled": 0,
+            "sessions_failed": 0,
+            "sessions_expired": 0,
+            "mismatches": 0,
+            "fresh_starts": 0,
+            "busy_rejections": 0,
+            "append_text_ms": RunningStats(),
+            "session_rtf": RunningStats(),
+            "last_chunk": None,
+            "last_session": None,
+        },
     }
 
 

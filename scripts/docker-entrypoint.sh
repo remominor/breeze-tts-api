@@ -14,6 +14,8 @@ exec python -m breeze_infer.api "${model_dir}" \
   --voice-dir "${voice_dir}" \
   --host "${BREEZE_HOST:-0.0.0.0}" \
   --port "${BREEZE_PORT:-7860}" \
+  --continuation-ttl-seconds "${BREEZE_CONTINUATION_TTL_SECONDS:-30}" \
+  --continuation-mismatch-policy "${BREEZE_CONTINUATION_MISMATCH_POLICY:-reject}" \
   --fast-backbone-decode \
   --fast-depth-decoder \
   --fast-codec \

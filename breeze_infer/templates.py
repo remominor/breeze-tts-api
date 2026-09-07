@@ -357,3 +357,28 @@ def prepare_inputs(
         inputs["cfg_scale"] = guidance_scale
 
     return inputs
+
+
+def prepare_continuation_text_inputs(
+    tokenizer: Any,
+    audio_tokenizer: Any,
+    model: Any,
+    text: str,
+    *,
+    speaker: str = "S0",
+) -> dict[str, torch.Tensor | None]:
+    """Encode one independent target-text segment for backbone continuation.
+
+    Continuation intentionally uses the same plain ``[S0]text`` rendering as
+    normal target text, but it does not rebuild the reference or instruction
+    prompt.  Keeping this helper beside the normal templates guarantees the
+    tokenizer round-trip and segment boundaries stay identical.
+    """
+    request = {"text": text, "speaker": speaker}
+    return _prepare_segment_batches(
+        tokenizer,
+        audio_tokenizer,
+        model.config,
+        model.device,
+        [_tts_plain_segments(request)],
+    )

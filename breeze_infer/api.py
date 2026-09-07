@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -26,6 +26,12 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from breeze_infer.audio import encode_prompt_audio
+from breeze_infer.continuation import (
+    ContinuationFingerprint,
+    ContinuationManager,
+    ContinuationMismatchError,
+    reference_code_identity,
+)
 from breeze_infer.observability import (
     cuda_snapshot,
     new_service_metrics,
@@ -42,6 +48,10 @@ from breeze_infer.runtime import (
 )
 from breeze_infer.templates import get_template, prepare_inputs
 from breeze_infer.text_chunks import estimate_speech_frames, split_text_to_fit
+from models.continuation_streaming import (
+    ContinuationContextError,
+    ContinuationStreamingRuntime,
+)
 from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
 from models.warmup_profile import load_warmup_profile
 
@@ -69,6 +79,8 @@ class ApiSettings:
     fast_backbone_decode: bool = False
     fast_depth_decoder: bool = False
     fast_codec: bool = False
+    continuation_ttl_seconds: float = 30.0
+    continuation_mismatch_policy: str = "reject"
 
 
 _settings: ApiSettings | None = None
@@ -268,10 +280,51 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
         app.state.audio_tokenizer,
         app.state.runtime,
     ) = tokenizer, model, audio_tokenizer, runtime
+    app.state.continuations = ContinuationManager(
+        ContinuationStreamingRuntime(runtime, audio_eos=True),
+        ttl_seconds=settings.continuation_ttl_seconds,
+        mismatch_policy=settings.continuation_mismatch_policy,
+    )
 
 
 def _model_is_loaded(app: FastAPI) -> bool:
     return getattr(app.state, "runtime", None) is not None
+
+
+def _cleanup_idle_continuation() -> bool:
+    manager = getattr(app.state, "continuations", None)
+    if manager is None or manager.session is None:
+        return False
+    session = manager.session
+    cleaned = manager.cleanup_idle()
+    if cleaned:
+        _record_closed_continuation(session, "replaced")
+    return cleaned
+
+
+def _record_closed_continuation(session, status: str) -> None:
+    values = app.state.metrics["continuation"]
+    if status == "expired":
+        values["sessions_expired"] += 1
+    elif status == "cancelled":
+        values["sessions_cancelled"] += 1
+    elif status == "failed":
+        values["sessions_failed"] += 1
+    else:
+        values["sessions_completed"] += 1
+    if session.total_audio_seconds > 0:
+        observe(
+            values,
+            "session_rtf",
+            session.total_wall_seconds / session.total_audio_seconds,
+        )
+    values["last_session"] = {
+        "continuation_id": session.continuation_id,
+        "status": status,
+        "chunks": session.successful_chunks,
+        "audio_seconds": round(session.total_audio_seconds, 4),
+        "wall_ms": round(session.total_wall_seconds * 1000.0, 2),
+    }
 
 
 def _ensure_model_loaded(app: FastAPI) -> bool:
@@ -318,12 +371,16 @@ def _unload_app(app: FastAPI) -> bool:
         return False
 
     started = time.perf_counter()
+    manager = getattr(app.state, "continuations", None)
+    if manager is not None:
+        manager.cleanup_idle()
     # Clear application references before collecting so compiled modules and
     # CUDA graph pools can be reclaimed instead of remaining reachable.
     app.state.runtime = None
     app.state.tokenizer = None
     app.state.model = None
     app.state.audio_tokenizer = None
+    app.state.continuations = None
     app.state.model_load_error = None
     _release_cuda_memory()
     app.state.metrics["model_unloads"] += 1
@@ -346,6 +403,7 @@ async def _lifespan(app: FastAPI):
     app.state.tokenizer = None
     app.state.model = None
     app.state.audio_tokenizer = None
+    app.state.continuations = None
     app.state.model_load_error = None
     app.state.start_time = time.monotonic()
     try:
@@ -354,9 +412,28 @@ async def _lifespan(app: FastAPI):
         # Keep the HTTP service alive after e.g. a transient CUDA OOM. The
         # explicit load endpoint and GPU-using requests can retry later.
         logger.exception("Breeze model was not loaded at startup; server is idle")
-    yield
-    if _model_is_loaded(app):
-        _unload_app(app)
+    async def expire_continuations() -> None:
+        while True:
+            await asyncio.sleep(min(1.0, _settings.continuation_ttl_seconds))
+            manager = getattr(app.state, "continuations", None)
+            if manager is None or not _request_lock.acquire(blocking=False):
+                continue
+            try:
+                session = manager.session
+                if manager.expire():
+                    _record_closed_continuation(session, "expired")
+            finally:
+                _request_lock.release()
+
+    expiry_task = asyncio.create_task(expire_continuations())
+    try:
+        yield
+    finally:
+        expiry_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await expiry_task
+        if _model_is_loaded(app):
+            _unload_app(app)
 
 
 app = FastAPI(title="Breeze TTS API", lifespan=_lifespan)
@@ -380,7 +457,8 @@ async def cors_middleware(request: Request, call_next):
         response.headers["Access-Control-Allow-Methods"] = "*"
         response.headers["Access-Control-Allow-Headers"] = "*"
         response.headers["Access-Control-Expose-Headers"] = (
-            "X-Sample-Rate, X-Audio-Sample-Rate, X-Request-Id, X-Sample-Format"
+            "X-Sample-Rate, X-Audio-Sample-Rate, X-Request-Id, X-Sample-Format, "
+            "X-Continuation-Id, X-Continuation-Chunk-Index, X-Continuation-Restarted"
         )
         response.headers["Vary"] = "Origin"
     return response
@@ -457,6 +535,7 @@ def metrics() -> dict:
         key: value for key, value in values.items() if isinstance(value, (int, float))
     }
     settings = app.state.cfg
+    continuation = values["continuation"]
     fast_stages = {
         stage: (
             bool(settings.fast_all)
@@ -509,6 +588,17 @@ def metrics() -> dict:
             "latency_ms": latency,
             "ttfa_ms": ttfa,
             "rtf": rtf,
+        },
+        "continuation": {
+            **{
+                key: value
+                for key, value in continuation.items()
+                if isinstance(value, (int, float))
+            },
+            "append_text_ms": stats_snapshot(continuation, "append_text_ms"),
+            "session_rtf": stats_snapshot(continuation, "session_rtf"),
+            "last_chunk": continuation["last_chunk"],
+            "last_session": continuation["last_session"],
         },
         "last_request": values["last_request"],
     }
@@ -604,6 +694,7 @@ async def upload_voice(request: Request) -> dict:
             except Exception as exc:
                 logger.exception("Breeze model load failed while preloading voice")
                 raise HTTPException(500, f"Model load failed: {exc}") from exc
+            _cleanup_idle_continuation()
             reference_codes = await asyncio.to_thread(
                 _encode_reference_bytes, app.state.audio_tokenizer, data
             )
@@ -822,6 +913,7 @@ async def speech(request: Request):
         except Exception as exc:
             logger.exception("Breeze model load failed while serving request")
             raise HTTPException(500, f"Model load failed: {exc}") from exc
+        _cleanup_idle_continuation()
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
             form = await request.json()
@@ -1209,6 +1301,379 @@ async def speech(request: Request):
             finish_request()
 
 
+@app.post("/v1/audio/speech/continuation")
+async def continuation_speech(request: Request):
+    """Generate one complete text chunk on a retained Breeze causal history."""
+    continuation_metrics = app.state.metrics["continuation"]
+    if not _request_lock.acquire(blocking=False):
+        continuation_metrics["busy_rejections"] += 1
+        raise HTTPException(409, "An inference request is already running.")
+
+    started = time.perf_counter()
+    finish_guard = threading.Lock()
+    lock_released = False
+    managed = None
+    request_succeeded = False
+    failure_status = "failed"
+    handoff = False
+
+    def finish_request() -> None:
+        nonlocal lock_released
+        with finish_guard:
+            if lock_released:
+                return
+            lock_released = True
+            if managed is not None and not request_succeeded:
+                app.state.continuations.fail_request(managed)
+                _record_closed_continuation(managed, failure_status)
+            _request_lock.release()
+
+    try:
+        try:
+            _ensure_model_loaded(app)
+        except Exception as exc:
+            logger.exception("Breeze model load failed while serving continuation")
+            raise HTTPException(500, f"Model load failed: {exc}") from exc
+
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            form = await request.json()
+            upload = None
+        else:
+            parsed = await request.form()
+            form = dict(parsed)
+            upload = parsed.get("ref_audio")
+        if hasattr(upload, "filename") and upload.filename:
+            raise HTTPException(
+                422,
+                "Continuation supports voice design and saved clone profiles only",
+            )
+
+        continuation_id = str(form.get("continuation_id") or "").strip()
+        if not continuation_id:
+            raise HTTPException(422, "continuation_id is required")
+        if len(continuation_id) > 128:
+            raise HTTPException(422, "continuation_id must be at most 128 characters")
+        text = str(form.get("input") or form.get("text") or "").strip()
+        if not text:
+            raise HTTPException(422, "input/text is required")
+        instruction = str(
+            form.get("instructions")
+            if form.get("instructions") is not None
+            else form.get("instruction") or ""
+        ).strip()
+        ref_text = (
+            form.get("reference_text")
+            if form.get("reference_text") is not None
+            else form.get("ref_text")
+        )
+        ref_text = str(ref_text).strip() if ref_text is not None else None
+        voice = str(form.get("voice") or "voice-design")
+        instruction, scale = _normalise_instruction_for_cfg(
+            instruction, form.get("guidance_scale", form.get("cfg_scale"))
+        )
+        seed = _parse_seed(form.get("seed", 42))
+        ref_request, template_name = _profile_request(
+            app.state.profiles,
+            voice,
+            ref_text=ref_text,
+            instruction=instruction,
+        )
+        if ref_request.get("ref_audio_path"):
+            codes = encode_prompt_audio(
+                app.state.audio_tokenizer, Path(ref_request["ref_audio_path"])
+            )
+            ref_request["ref_audio_codes"] = codes
+            ref_request.pop("ref_audio_path", None)
+            if ref_request.get("profile_id"):
+                app.state.profiles.save_codes(ref_request["profile_id"], codes)
+
+        response_format = str(form.get("response_format") or "wav").lower()
+        stream_format = str(form.get("stream_format") or "audio").lower()
+        if response_format not in {"wav", "pcm"}:
+            raise HTTPException(422, "Breeze supports response_format=wav or pcm")
+        if stream_format not in {"audio", "sse"}:
+            raise HTTPException(422, "stream_format must be audio or sse")
+        stream = _parse_stream(form.get("stream", False)) or stream_format == "sse"
+        sample_rate = app.state.runtime.sample_rate
+        fingerprint = ContinuationFingerprint(
+            voice_identity=str(ref_request.get("profile_id") or "voice-design"),
+            effective_ref_text=ref_request.get("ref_text"),
+            reference_code_identity=reference_code_identity(
+                ref_request.get("ref_audio_codes")
+            ),
+            template=template_name,
+            instruction=instruction,
+            guidance_scale=scale,
+            seed=seed,
+            cfg_mode="no_cfg" if scale == 1.0 else "single_cfg",
+            sample_rate=sample_rate,
+        )
+        try:
+            operation, restarted = app.state.continuations.classify(
+                continuation_id, fingerprint
+            )
+        except ContinuationMismatchError as exc:
+            continuation_metrics["mismatches"] += 1
+            raise HTTPException(409, str(exc)) from exc
+        replaced_session = app.state.continuations.session if restarted else None
+
+        estimated_frames = estimate_speech_frames(app.state.tokenizer, text)
+        inputs = None
+        if operation == "start":
+            initial_request = {
+                **ref_request,
+                "id": f"continuation-{continuation_id}-0",
+                "text": text,
+                "instruction": instruction,
+                "speaker": "S0",
+            }
+            inputs = prepare_inputs(
+                app.state.tokenizer,
+                app.state.audio_tokenizer,
+                app.state.model,
+                [initial_request],
+                get_template(template_name),
+                guidance_scale=scale,
+                guidance_scale_ref=None,
+                guidance_scale_ins=None,
+            )
+            prompt_tokens = _prompt_token_count(inputs)
+            if (
+                prompt_tokens + estimated_frames + CONTEXT_SAFETY_FRAMES
+                >= MAX_SEQ_LEN
+            ):
+                raise HTTPException(
+                    409, "continuation context limit exceeded for initial chunk"
+                )
+            managed = app.state.continuations.start(
+                continuation_id, fingerprint, inputs
+            )
+            if replaced_session is not None:
+                _record_closed_continuation(replaced_session, "replaced")
+            continuation_metrics["sessions_started"] += 1
+            if restarted:
+                continuation_metrics["fresh_starts"] += 1
+        else:
+            managed = app.state.continuations.continue_session(continuation_id)
+
+        request_id = f"continuation-api-{uuid.uuid4().hex}"
+        chunk_index = managed.runtime_state.chunk_index
+
+        def runtime_chunks(cancel_event: threading.Event | None = None):
+            if operation == "start":
+                return app.state.continuations.runtime.iter_start(
+                    managed.runtime_state,
+                    inputs,
+                    seed=seed,
+                    estimated_audio_frames=estimated_frames,
+                    context_safety_frames=CONTEXT_SAFETY_FRAMES,
+                    cancel_event=cancel_event,
+                )
+            return app.state.continuations.runtime.iter_continue(
+                managed.runtime_state,
+                text,
+                estimated_audio_frames=estimated_frames,
+                context_safety_frames=CONTEXT_SAFETY_FRAMES,
+                cancel_event=cancel_event,
+            )
+
+        def record_success(
+            *, pcm_bytes: int, first_audio_at: float | None, chunks: int
+        ) -> None:
+            nonlocal request_succeeded
+            request_succeeded = True
+            wall_ms = (time.perf_counter() - started) * 1000.0
+            audio_seconds = pcm_bytes / (2 * sample_rate)
+            app.state.continuations.finish_request(
+                managed,
+                audio_seconds=audio_seconds,
+                wall_seconds=wall_ms / 1000.0,
+            )
+            timing = managed.runtime_state.last_timing
+            append_ms = float(timing.get("text_encoder_ms", 0.0)) + float(
+                timing.get("append_prefill_ms", 0.0)
+            )
+            if operation == "continue":
+                observe(continuation_metrics, "append_text_ms", append_ms)
+            continuation_metrics["last_chunk"] = {
+                "continuation_id": continuation_id,
+                "chunk_index": chunk_index,
+                "operation": operation,
+                "restarted": restarted,
+                "wall_ms": round(wall_ms, 2),
+                "ttfa_ms": (
+                    round((first_audio_at - started) * 1000.0, 2)
+                    if first_audio_at is not None
+                    else None
+                ),
+                "audio_seconds": round(audio_seconds, 4),
+                "rtf": round(wall_ms / 1000.0 / audio_seconds, 4),
+                "chunks": chunks,
+                **timing,
+            }
+
+        if stream:
+            async def stream_body() -> AsyncIterator[bytes]:
+                nonlocal failure_status
+                pcm_bytes = 0
+                chunk_count = 0
+                first_audio_at: float | None = None
+                pending: bytes | None = None
+                cancel_event = threading.Event()
+                disconnected = False
+                sentinel = object()
+
+                async def watch_disconnect() -> None:
+                    nonlocal disconnected
+                    while not cancel_event.is_set():
+                        if await request.is_disconnected():
+                            disconnected = True
+                            cancel_event.set()
+                            return
+                        await asyncio.sleep(0.05)
+
+                watcher = asyncio.create_task(watch_disconnect())
+                iterator = runtime_chunks(cancel_event)
+                try:
+                    while not cancel_event.is_set():
+                        next_chunk = asyncio.create_task(
+                            asyncio.to_thread(next, iterator, sentinel)
+                        )
+                        try:
+                            chunk = await asyncio.shield(next_chunk)
+                        except asyncio.CancelledError:
+                            cancel_event.set()
+                            with suppress(asyncio.CancelledError):
+                                await asyncio.shield(next_chunk)
+                            raise
+                        if chunk is sentinel or cancel_event.is_set():
+                            break
+                        item = _pcm16(chunk.audio)
+                        if not item:
+                            continue
+                        if first_audio_at is None:
+                            first_audio_at = time.perf_counter()
+                        pcm_bytes += len(item)
+                        if stream_format == "sse":
+                            if pending is not None:
+                                payload = {
+                                    "type": "audio.chunk",
+                                    "data": base64.b64encode(
+                                        _wav(pending, sample_rate)
+                                        if response_format == "wav"
+                                        else pending
+                                    ).decode(),
+                                    "format": response_format,
+                                    "sample_rate": sample_rate,
+                                    "chunk_index": chunk_count - 1,
+                                    "final": False,
+                                }
+                                yield f"data: {json.dumps(payload)}\n\n".encode()
+                            pending = item
+                        else:
+                            yield item
+                        chunk_count += 1
+                        if disconnected:
+                            failure_status = "cancelled"
+                            return
+                    if chunk_count == 0:
+                        raise RuntimeError("Breeze produced an empty audio response")
+                    if stream_format == "sse":
+                        if pending is not None:
+                            payload = {
+                                "type": "audio.chunk",
+                                "data": base64.b64encode(
+                                    _wav(pending, sample_rate)
+                                    if response_format == "wav"
+                                    else pending
+                                ).decode(),
+                                "format": response_format,
+                                "sample_rate": sample_rate,
+                                "chunk_index": chunk_count - 1,
+                                "final": True,
+                            }
+                            yield f"data: {json.dumps(payload)}\n\n".encode()
+                        yield f"data: {json.dumps({'type': 'done', 'chunks': chunk_count, 'request_id': request_id})}\n\n".encode()
+                        yield b"data: [DONE]\n\n"
+                    record_success(
+                        pcm_bytes=pcm_bytes,
+                        first_audio_at=first_audio_at,
+                        chunks=chunk_count,
+                    )
+                except Exception as exc:
+                    if isinstance(exc, ContinuationContextError):
+                        logger.warning("Breeze continuation exhausted context: %s", exc)
+                    else:
+                        logger.exception("Breeze continuation streaming failed")
+                    if stream_format == "sse" and not disconnected:
+                        yield f"data: {json.dumps({'type': 'error', 'error': str(exc), 'message': str(exc)})}\n\n".encode()
+                    elif not disconnected:
+                        raise
+                finally:
+                    cancel_event.set()
+                    iterator.close()
+                    watcher.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await watcher
+                    finish_request()
+
+            media = "text/event-stream" if stream_format == "sse" else "audio/pcm"
+            handoff = True
+            return StreamingResponse(
+                stream_body(),
+                media_type=media,
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Sample-Rate": str(sample_rate),
+                    "X-Audio-Sample-Rate": str(sample_rate),
+                    "X-Sample-Format": "s16le",
+                    "X-Request-Id": request_id,
+                    "X-Continuation-Id": continuation_id,
+                    "X-Continuation-Chunk-Index": str(chunk_index),
+                    "X-Continuation-Restarted": str(restarted).lower(),
+                },
+                background=BackgroundTask(finish_request),
+            )
+
+        chunks = []
+        first_audio_at = None
+        for chunk in runtime_chunks():
+            item = _pcm16(chunk.audio)
+            if item:
+                if first_audio_at is None:
+                    first_audio_at = time.perf_counter()
+                chunks.append(item)
+        pcm = b"".join(chunks)
+        if not pcm:
+            raise RuntimeError("Breeze produced an empty audio response")
+        record_success(
+            pcm_bytes=len(pcm), first_audio_at=first_audio_at, chunks=len(chunks)
+        )
+        output = _wav(pcm, sample_rate) if response_format == "wav" else pcm
+        return Response(
+            output,
+            media_type="audio/wav" if response_format == "wav" else "audio/pcm",
+            headers={
+                "X-Sample-Rate": str(sample_rate),
+                "X-Audio-Sample-Rate": str(sample_rate),
+                "X-Request-Id": request_id,
+                "X-Continuation-Id": continuation_id,
+                "X-Continuation-Chunk-Index": str(chunk_index),
+                "X-Continuation-Restarted": str(restarted).lower(),
+            },
+        )
+    except HTTPException:
+        raise
+    except ContinuationContextError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(500, f"Continuation synthesis failed: {exc}") from exc
+    finally:
+        if not handoff:
+            finish_request()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve Breeze TTS 2")
     parser.add_argument("model", type=Path)
@@ -1218,6 +1683,12 @@ def main() -> None:
     parser.add_argument("--cors-origins", default=",".join(ApiSettings.cors_origins))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--continuation-ttl-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--continuation-mismatch-policy",
+        choices=("reject", "fresh_start"),
+        default="reject",
+    )
     for flag in (
         "fast-all",
         "fast-text-encoder",
@@ -1247,6 +1718,8 @@ def main() -> None:
         fast_backbone_decode=args.fast_backbone_decode,
         fast_depth_decoder=args.fast_depth_decoder,
         fast_codec=args.fast_codec,
+        continuation_ttl_seconds=args.continuation_ttl_seconds,
+        continuation_mismatch_policy=args.continuation_mismatch_policy,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

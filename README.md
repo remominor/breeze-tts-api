@@ -17,6 +17,7 @@ paths, and explicit GPU model load/unload controls.
 ## Highlights
 
 - `POST /v1/audio/speech` for voice design, cloning, and direction.
+- Experimental stateful continuation across complete client-chunked requests.
 - Hybrid INT8 ConvRot backbone/text encoder with BF16 depth decoder.
 - Lean service loader omits the checkpoint's unused legacy Mimi codec and
   fallback text embedding, saving roughly 1.2 GiB of model VRAM.
@@ -176,6 +177,47 @@ Use `stream=true` for a streaming response. Raw streaming output is PCM; use
 the `X-Sample-Rate: 24000` and `X-Sample-Format: s16le` headers. Set
 `stream_format=sse` for server-sent audio chunk events.
 
+### Experimental stateful continuation
+
+`POST /v1/audio/speech/continuation` keeps the Breeze backbone, CFG, RNG,
+repetition, and streaming-codec state between complete HTTP requests. The
+client still decides sentence/clause boundaries and sends only one request at
+a time; the server does not accept streamed text and does not queue inference.
+
+Send a client-generated `continuation_id` with every chunk. The first request
+for an ID starts a trajectory and later requests with the same effective
+voice, instruction, guidance scale, and seed append text to it. No start/end
+action is needed:
+
+```bash
+for text in \
+  "I think that's probably the best approach." \
+  "There is one thing we should test first." \
+  "After that, we should know whether it is worth pursuing."
+do
+  curl -sS http://127.0.0.1:7860/v1/audio/speech/continuation \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg text "$text" '{
+      input: $text,
+      voice: "clone:sky",
+      instructions: "Warm, conversational and engaged.",
+      guidance_scale: 4,
+      seed: 42,
+      continuation_id: "assistant-response-123",
+      stream: true,
+      response_format: "pcm"
+    }')" >> response.pcm
+done
+```
+
+A different continuation ID or a normal speech request replaces idle retained
+state. A request arriving during GPU work receives `409` and is never queued.
+The default 30-second idle TTL also releases abandoned state. Same-ID
+configuration mismatches return `409`; set
+`BREEZE_CONTINUATION_MISMATCH_POLICY=fresh_start` to replace instead. The
+experimental endpoint supports saved clone profiles and voice design, but not
+one-off multipart reference uploads.
+
 ### GPU model lifecycle
 
 ```bash
@@ -222,6 +264,7 @@ to save it without loading the model.
 | `GET /health` | Readiness and model state |
 | `GET /docs` | Swagger UI |
 | `POST /v1/audio/speech` | Design, clone, or direct speech |
+| `POST /v1/audio/speech/continuation` | Append a complete text chunk to retained generation state |
 | `POST /v1/model/load` | Load the model onto GPU |
 | `POST /v1/model/unload` | Release model and CUDA-graph memory |
 | `GET /v1/audio/voices` | List built-in and saved voices |
