@@ -336,7 +336,7 @@ def test_continuation_gap_uses_continuation_codec_sample_rate(configured) -> Non
     assert second.headers["x-sample-rate"] == "24000"
 
 
-def test_raw_streaming_followup_emits_silence_first() -> None:
+def test_raw_streaming_followup_prefixes_silence_to_first_audio_buffer() -> None:
     asyncio.run(continuation_speech(_Request(_payload())))
     response = asyncio.run(
         continuation_speech(_Request(_payload(input="again", stream=True)))
@@ -347,13 +347,12 @@ def test_raw_streaming_followup_emits_silence_first() -> None:
 
     parts = asyncio.run(consume())
     asyncio.run(response.background())
-    assert parts[0] == bytes(24_000 * 10 // 1000 * 2)
-    assert parts[1] == api_module._pcm16(
-        np.array([0.25, -0.25], dtype=np.float32)
-    )
+    expected_audio = api_module._pcm16(np.array([0.25, -0.25], dtype=np.float32))
+    assert len(parts) == 1
+    assert parts[0] == bytes(24_000 * 10 // 1000 * 2) + expected_audio
 
 
-def test_sse_followup_emits_silence_as_first_audio_event() -> None:
+def test_sse_followup_prefixes_silence_to_first_audio_event() -> None:
     asyncio.run(continuation_speech(_Request(_payload())))
     response = asyncio.run(
         continuation_speech(
@@ -368,6 +367,7 @@ def test_sse_followup_emits_silence_as_first_audio_event() -> None:
     asyncio.run(response.background())
     first_event = json.loads(body.splitlines()[0].removeprefix(b"data: "))
     assert first_event["type"] == "audio.chunk"
+    expected_audio = api_module._pcm16(np.array([0.25, -0.25], dtype=np.float32))
     assert base64.b64decode(first_event["data"]) == bytes(
         24_000 * 10 // 1000 * 2
-    )
+    ) + expected_audio

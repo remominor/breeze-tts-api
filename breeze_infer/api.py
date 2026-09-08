@@ -1606,13 +1606,12 @@ async def continuation_speech(request: Request):
                     failure_status = "cancelled"
                     finish_request()
                     return
-                pcm_bytes = len(segment_gap_pcm)
-                chunk_count = int(bool(segment_gap_pcm))
+                pcm_bytes = 0
+                chunk_count = 0
                 generated_chunk_count = 0
                 first_audio_at: float | None = None
-                pending: bytes | None = (
-                    segment_gap_pcm if stream_format == "sse" else None
-                )
+                pending: bytes | None = None
+                gap_prefix = segment_gap_pcm
                 cancel_event = threading.Event()
                 disconnected = False
                 sentinel = object()
@@ -1630,8 +1629,6 @@ async def continuation_speech(request: Request):
                 watcher = asyncio.create_task(watch_disconnect())
                 iterator = runtime_chunks(cancel_event)
                 try:
-                    if segment_gap_pcm and stream_format != "sse":
-                        yield segment_gap_pcm
                     while not cancel_event.is_set():
                         next_chunk = asyncio.create_task(
                             asyncio.to_thread(next, iterator, sentinel)
@@ -1649,6 +1646,13 @@ async def continuation_speech(request: Request):
                         item = _pcm16(chunk.audio)
                         if not item:
                             continue
+                        if gap_prefix:
+                            # Keep padding in the same PCM buffer as the first
+                            # generated audio. Consumers may frame each buffer
+                            # independently; a standalone silence buffer can
+                            # create a boundary artifact.
+                            item = gap_prefix + item
+                            gap_prefix = b""
                         if first_audio_at is None:
                             first_audio_at = time.perf_counter()
                         pcm_bytes += len(item)
