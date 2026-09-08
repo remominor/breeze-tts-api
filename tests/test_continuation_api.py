@@ -210,6 +210,15 @@ def test_continuation_requires_client_id() -> None:
     assert exc_info.value.status_code == 422
 
 
+@pytest.mark.parametrize("text", [".", "...", "!? —"])
+def test_continuation_rejects_punctuation_only_text(text: str) -> None:
+    with pytest.raises(HTTPException, match="letter or digit") as exc_info:
+        asyncio.run(continuation_speech(_Request(_payload(input=text))))
+
+    assert exc_info.value.status_code == 422
+    assert app.state.continuations.session is None
+
+
 def test_omitted_and_explicit_default_cfg_match() -> None:
     asyncio.run(
         continuation_speech(

@@ -145,6 +145,17 @@ def _parse_seed(value: object) -> int:
         raise HTTPException(422, "seed must be an integer") from exc
 
 
+def _validate_speakable_text(text: str) -> str:
+    """Reject empty and punctuation-only prompts before acoustic generation."""
+    if not text:
+        raise HTTPException(422, "input/text is required")
+    if not any(char.isalnum() for char in text):
+        raise HTTPException(
+            422, "input/text must contain at least one letter or digit"
+        )
+    return text
+
+
 def _parse_stream(value: object) -> bool:
     if value is None:
         return False
@@ -935,9 +946,9 @@ async def speech(request: Request):
             parsed = await request.form()
             form = dict(parsed)
             upload = parsed.get("ref_audio")
-        text = str(form.get("input") or form.get("text") or "").strip()
-        if not text:
-            raise HTTPException(422, "input/text is required")
+        text = _validate_speakable_text(
+            str(form.get("input") or form.get("text") or "").strip()
+        )
         instruction = str(
             form.get("instructions")
             if form.get("instructions") is not None
@@ -1367,9 +1378,9 @@ async def continuation_speech(request: Request):
             raise HTTPException(422, "continuation_id is required")
         if len(continuation_id) > 128:
             raise HTTPException(422, "continuation_id must be at most 128 characters")
-        text = str(form.get("input") or form.get("text") or "").strip()
-        if not text:
-            raise HTTPException(422, "input/text is required")
+        text = _validate_speakable_text(
+            str(form.get("input") or form.get("text") or "").strip()
+        )
         instruction = str(
             form.get("instructions")
             if form.get("instructions") is not None

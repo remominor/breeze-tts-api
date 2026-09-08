@@ -22,6 +22,7 @@ from breeze_infer.api import (
     _profile_request,
     _prompt_token_count,
     _quiet_expected_torch_compile_warnings,
+    _validate_speakable_text,
     _voice_item,
     app,
     load_model,
@@ -138,6 +139,33 @@ def test_automatic_request_defaults_to_plain_cfg_one() -> None:
 
     assert instruction == ""
     assert scale == 1.0
+
+
+@pytest.mark.parametrize("text", [".", "...", "!? —"])
+def test_punctuation_only_text_is_rejected_before_synthesis(text: str) -> None:
+    with pytest.raises(HTTPException, match="letter or digit") as exc_info:
+        _validate_speakable_text(text.strip())
+
+    assert exc_info.value.status_code == 422
+
+
+def test_unicode_speakable_text_is_accepted() -> None:
+    assert _validate_speakable_text("你好。") == "你好。"
+
+
+def test_speech_rejects_punctuation_only_text_before_generation(monkeypatch) -> None:
+    _configure_fake_speech_state(monkeypatch)
+
+    with pytest.raises(HTTPException, match="letter or digit") as exc_info:
+        asyncio.run(
+            speech(
+                _JsonRequest(
+                    {"input": ".", "instructions": "Warm and conversational."}
+                )
+            )
+        )
+
+    assert exc_info.value.status_code == 422
 
 
 @pytest.mark.parametrize("value", ["bad", object()])
