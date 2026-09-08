@@ -279,6 +279,23 @@ def test_normal_request_rejects_pending_continuation_without_holding_lock() -> N
     assert not api_module._request_lock.locked()
 
 
+def test_failure_cleanup_error_still_releases_request_lock(configured) -> None:
+    def fail_generation(*_args, **_kwargs):
+        raise RuntimeError("generation failed")
+
+    def fail_close(_state):
+        raise RuntimeError("codec close failed")
+
+    configured.iter_start = fail_generation
+    configured.close = fail_close
+
+    with pytest.raises(HTTPException, match="Continuation synthesis failed"):
+        asyncio.run(continuation_speech(_Request(_payload())))
+
+    assert not api_module._request_lock.locked()
+    assert app.state.continuations.session is None
+
+
 def test_stream_disconnect_after_audio_invalidates_session(configured) -> None:
     request = _DisconnectRequest(_payload(stream=True, response_format="pcm"))
     response = asyncio.run(continuation_speech(request))

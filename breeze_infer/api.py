@@ -441,6 +441,10 @@ async def _lifespan(app: FastAPI):
                 session = manager.session
                 if manager.expire():
                     _record_closed_continuation(session, "expired")
+            except Exception:
+                # Cleanup must not terminate the expiry task or strand the
+                # admission lock if codec/KV teardown reports an error.
+                logger.exception("Breeze continuation expiry cleanup failed")
             finally:
                 _request_lock.release()
 
@@ -1358,12 +1362,20 @@ async def continuation_speech(request: Request):
             if finished:
                 return
             finished = True
-            if managed is not None and not request_succeeded:
-                app.state.continuations.fail_request(managed)
-                _record_closed_continuation(managed, failure_status)
-            if lock_held:
-                _request_lock.release()
-                lock_held = False
+            try:
+                if managed is not None and not request_succeeded:
+                    try:
+                        app.state.continuations.fail_request(managed)
+                    except Exception:
+                        logger.exception("Breeze continuation failure cleanup failed")
+                    try:
+                        _record_closed_continuation(managed, failure_status)
+                    except Exception:
+                        logger.exception("Breeze continuation metrics cleanup failed")
+            finally:
+                if lock_held:
+                    _request_lock.release()
+                    lock_held = False
 
     def release_request_lock() -> None:
         nonlocal lock_held
