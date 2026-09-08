@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import threading
 import time
 from types import SimpleNamespace
 
@@ -389,6 +390,55 @@ def test_abandoned_stream_background_releases_inference_lock(monkeypatch) -> Non
     assert api_module._request_lock.locked()
 
     asyncio.run(response.background())
+
+    assert not api_module._request_lock.locked()
+
+
+def test_cancelled_stream_defers_generator_close_until_worker_finishes(
+    monkeypatch,
+) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+
+    class _CancellableRuntime:
+        fast_enabled = True
+        sample_rate = 24_000
+
+        def __init__(self) -> None:
+            self.cancel_seen = threading.Event()
+
+        def iter_audio_chunks(
+            self, _inputs, *, request_id, seed=None, cancel_event=None
+        ):
+            yield SimpleNamespace(audio=np.array([0.25, -0.25], dtype=np.float32))
+            while True:
+                time.sleep(0.02)
+                if cancel_event is not None and cancel_event.is_set():
+                    self.cancel_seen.set()
+                    return
+                yield SimpleNamespace(
+                    audio=np.array([0.25, -0.25], dtype=np.float32)
+                )
+
+    runtime = _CancellableRuntime()
+    app.state.runtime = runtime
+    response = asyncio.run(
+        speech(_JsonRequest({"input": "hello", "stream": True}))
+    )
+
+    async def cancel_generation() -> None:
+        iterator = response.body_iterator
+        assert await anext(iterator)
+        pending = asyncio.create_task(anext(iterator))
+        await asyncio.sleep(0.01)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert await asyncio.to_thread(runtime.cancel_seen.wait, 2)
+        await response.background()
+
+    asyncio.run(cancel_generation())
 
     assert not api_module._request_lock.locked()
 

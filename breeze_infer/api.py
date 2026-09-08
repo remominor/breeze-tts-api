@@ -942,6 +942,9 @@ async def speech(request: Request):
                 temp_path.unlink(missing_ok=True)
             _request_lock.release()
 
+    async def finish_stream_background() -> None:
+        finish_request()
+
     try:
         try:
             _ensure_model_loaded(app)
@@ -1092,6 +1095,32 @@ async def speech(request: Request):
                 internal_timings: dict[str, float] = {}
                 cancel_event = threading.Event()
                 sentinel = object()
+                deferred_finish = False
+
+                def finish_after_pending_next(
+                    pending_task: asyncio.Task, pending_iterator
+                ) -> None:
+                    # A response disconnect can cancel this task while the
+                    # worker thread is still inside next(iterator).  Do not
+                    # close the generator or release the admission lock until
+                    # that call has returned; closing it concurrently raises
+                    # ``ValueError: generator already executing`` and can
+                    # strand the ASGI request.
+                    if not pending_task.cancelled() and (
+                        pending_error := pending_task.exception()
+                    ) is not None:
+                        logger.debug(
+                            "Breeze pending generation ended with an error: %s",
+                            pending_error,
+                        )
+                    try:
+                        pending_iterator.close()
+                    except Exception:
+                        logger.exception(
+                            "Breeze streaming iterator cleanup failed"
+                        )
+                    finally:
+                        finish_request()
 
                 async def watch_disconnect() -> None:
                     while not cancel_event.is_set():
@@ -1145,8 +1174,16 @@ async def speech(request: Request):
                                     # disconnect. Let the worker finish the
                                     # current CUDA call and observe this event.
                                     cancel_event.set()
-                                    with suppress(asyncio.CancelledError):
-                                        await asyncio.shield(next_chunk)
+                                    app.state.metrics["streaming_cancelled"] += 1
+                                    if next_chunk.done():
+                                        chunk_iterator.close()
+                                    else:
+                                        deferred_finish = True
+                                        next_chunk.add_done_callback(
+                                            lambda task, iterator=chunk_iterator: finish_after_pending_next(
+                                                task, iterator
+                                            )
+                                        )
                                     raise
                                 if chunk is sentinel:
                                     break
@@ -1187,7 +1224,7 @@ async def speech(request: Request):
                         finally:
                             # A completed synchronous generator runs its
                             # cleanup (including codec request teardown).
-                            if cancel_event.is_set():
+                            if cancel_event.is_set() and next_chunk.done():
                                 chunk_iterator.close()
                         if cancel_event.is_set():
                             app.state.metrics["streaming_cancelled"] += 1
@@ -1245,7 +1282,8 @@ async def speech(request: Request):
                     disconnect_watcher.cancel()
                     with suppress(asyncio.CancelledError):
                         await disconnect_watcher
-                    finish_request()
+                    if not deferred_finish:
+                        finish_request()
 
             media = "text/event-stream" if stream_format == "sse" else "audio/pcm"
             handoff = True
@@ -1259,7 +1297,7 @@ async def speech(request: Request):
                     "X-Sample-Format": "s16le",
                     "X-Request-Id": request_id,
                 },
-                background=BackgroundTask(finish_request),
+                background=BackgroundTask(finish_stream_background),
             )
         active_runtime = app.state.runtime
         chunks = []
@@ -1376,6 +1414,9 @@ async def continuation_speech(request: Request):
                 if lock_held:
                     _request_lock.release()
                     lock_held = False
+
+    async def finish_stream_background() -> None:
+        finish_request()
 
     def release_request_lock() -> None:
         nonlocal lock_held
@@ -1627,6 +1668,30 @@ async def continuation_speech(request: Request):
                 cancel_event = threading.Event()
                 disconnected = False
                 sentinel = object()
+                deferred_finish = False
+
+                def finish_after_pending_next(
+                    pending_task: asyncio.Task, pending_iterator
+                ) -> None:
+                    # The response task may be cancelled while the worker
+                    # thread is executing next(iterator).  Wait for that
+                    # operation via the task callback before touching the
+                    # generator or releasing the single-inference lock.
+                    if not pending_task.cancelled() and (
+                        pending_error := pending_task.exception()
+                    ) is not None:
+                        logger.debug(
+                            "Breeze pending continuation ended with an error: %s",
+                            pending_error,
+                        )
+                    try:
+                        pending_iterator.close()
+                    except Exception:
+                        logger.exception(
+                            "Breeze continuation iterator cleanup failed"
+                        )
+                    finally:
+                        finish_request()
 
                 async def watch_disconnect() -> None:
                     nonlocal disconnected, failure_status
@@ -1650,8 +1715,15 @@ async def continuation_speech(request: Request):
                         except asyncio.CancelledError:
                             failure_status = "cancelled"
                             cancel_event.set()
-                            with suppress(asyncio.CancelledError):
-                                await asyncio.shield(next_chunk)
+                            if next_chunk.done():
+                                iterator.close()
+                            else:
+                                deferred_finish = True
+                                next_chunk.add_done_callback(
+                                    lambda task, pending_iterator=iterator: finish_after_pending_next(
+                                        task, pending_iterator
+                                    )
+                                )
                             raise
                         if chunk is sentinel or cancel_event.is_set():
                             break
@@ -1732,11 +1804,13 @@ async def continuation_speech(request: Request):
                         raise
                 finally:
                     cancel_event.set()
-                    iterator.close()
+                    if not deferred_finish:
+                        iterator.close()
                     watcher.cancel()
                     with suppress(asyncio.CancelledError):
                         await watcher
-                    finish_request()
+                    if not deferred_finish:
+                        finish_request()
 
             media = "text/event-stream" if stream_format == "sse" else "audio/pcm"
             release_request_lock()
@@ -1755,7 +1829,7 @@ async def continuation_speech(request: Request):
                     "X-Continuation-Restarted": str(restarted).lower(),
                     "X-Continuation-Gap-Ms": str(segment_gap_ms),
                 },
-                background=BackgroundTask(finish_request),
+                background=BackgroundTask(finish_stream_background),
             )
 
         generated_chunks = []
