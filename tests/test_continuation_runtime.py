@@ -172,6 +172,65 @@ def test_preflight_rejects_context_without_running_text_encoder(monkeypatch) -> 
     assert graph.calls == []
 
 
+def test_repetition_penalty_history_restarts_for_each_text_segment(
+    monkeypatch,
+) -> None:
+    runtime = _Runtime()
+    runtime.config.repetition_penalty = 1.1
+    runtime.config.max_new_tokens = 8
+    runtime.model.config.vocab_size = 8
+    runtime.model.config.codebook_pad_token_id = 99
+    runtime.model.generation_config = object()
+    runtime.model.depth_decoder = SimpleNamespace(generation_config=object())
+    runtime._depth_decoder_graph = SimpleNamespace(
+        run=lambda *_args, **_kwargs: torch.tensor([[2]])
+    )
+    runtime._reserved_codec_token_ids = ()
+    runtime.codec_chunk_frames = 1
+    runtime._sampling_params = lambda _config: {
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 1.0,
+        "do_sample": False,
+    }
+    graph = _Graph()
+    graph.run = lambda *_args, **_kwargs: (
+        torch.ones(2, 1, 4),
+        torch.zeros(1, 9),
+    )
+    continuation = ContinuationStreamingRuntime(runtime)
+    state = _session(graph)
+    state.generated_frames = 3
+    state.token_history[:3] = torch.tensor([4, 5, 6])
+    histories = []
+    sampled = iter((torch.tensor(1), torch.tensor(8)))
+
+    def sample(_logits, *, token_history, **_kwargs):
+        histories.append(token_history.clone())
+        return next(sampled)
+
+    monkeypatch.setattr(continuation_module, "sample_logits", sample)
+    monkeypatch.setattr(
+        continuation,
+        "_decode_frames",
+        lambda *_args, **_kwargs: SimpleNamespace(audio=torch.zeros(1)),
+    )
+    monkeypatch.setattr(continuation, "_capture_rng", lambda _state: None)
+
+    list(
+        continuation._generate(
+            state,
+            torch.ones(2, 1, 4),
+            torch.zeros(1, 9),
+            cancel_event=None,
+            base_timing={},
+        )
+    )
+
+    assert histories[0].numel() == 0
+    assert histories[1].tolist() == [1]
+
+
 def test_codec_lifetime_spans_logical_requests_and_closes_once() -> None:
     runtime = _Runtime()
     graph = _Graph()

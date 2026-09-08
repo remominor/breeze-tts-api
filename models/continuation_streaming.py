@@ -365,9 +365,16 @@ class ContinuationStreamingRuntime:
         depth_params = self.runtime._sampling_params(
             self.runtime.model.depth_decoder.generation_config
         )
+        # Retain all acoustic tokens for diagnostics/session state, but apply
+        # repetition penalty only within this target-text segment. Carrying
+        # the heuristic across sentences progressively penalizes most of the
+        # acoustic vocabulary and can produce unstable trailing speech.
+        repetition_history_start = session.generated_frames
         token = sample_logits(
             logits,
-            token_history=session.token_history[: session.generated_frames],
+            token_history=session.token_history[
+                repetition_history_start : session.generated_frames
+            ],
             repetition_penalty=self.runtime.config.repetition_penalty,
             suppress_tokens=self.runtime._reserved_codec_token_ids,
             **backbone_params,
@@ -379,7 +386,6 @@ class ContinuationStreamingRuntime:
         chunk_started = time.perf_counter()
         generation_started = chunk_started
         terminated = False
-
         for local_step in range(self.runtime.config.max_new_tokens):
             if cancel_event is not None and cancel_event.is_set():
                 raise ContinuationRuntimeError("continuation generation cancelled")
@@ -416,7 +422,9 @@ class ContinuationStreamingRuntime:
             generated_steps += 1
             token = sample_logits(
                 logits.float(),
-                token_history=session.token_history[: history_index + 1],
+                token_history=session.token_history[
+                    repetition_history_start : history_index + 1
+                ],
                 repetition_penalty=self.runtime.config.repetition_penalty,
                 suppress_tokens=self.runtime._reserved_codec_token_ids,
                 **backbone_params,

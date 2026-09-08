@@ -225,6 +225,9 @@ transitions from sounding crowded without changing retained model or codec
 state. Set `BREEZE_CONTINUATION_SEGMENT_GAP_MS` to tune the gap, or `0` to
 disable it.
 
+Repetition-penalty history resets at each submitted text segment; the retained
+backbone KV, RNG progression, and codec state remain continuous.
+
 ### GPU model lifecycle
 
 ```bash
