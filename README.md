@@ -220,6 +220,11 @@ configuration mismatches return `409`; set
 experimental endpoint supports saved clone profiles and voice design, but not
 one-off multipart reference uploads.
 
+Follow-up responses begin with 120 ms of PCM silence to keep sentence
+transitions from sounding crowded without changing retained model or codec
+state. Set `BREEZE_CONTINUATION_SEGMENT_GAP_MS` to tune the gap, or `0` to
+disable it.
+
 ### GPU model lifecycle
 
 ```bash

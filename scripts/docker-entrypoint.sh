@@ -15,6 +15,7 @@ exec python -m breeze_infer.api "${model_dir}" \
   --host "${BREEZE_HOST:-0.0.0.0}" \
   --port "${BREEZE_PORT:-7860}" \
   --continuation-ttl-seconds "${BREEZE_CONTINUATION_TTL_SECONDS:-30}" \
+  --continuation-segment-gap-ms "${BREEZE_CONTINUATION_SEGMENT_GAP_MS:-120}" \
   --continuation-mismatch-policy "${BREEZE_CONTINUATION_MISMATCH_POLICY:-reject}" \
   --fast-backbone-decode \
   --fast-depth-decoder \

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import time
 from types import SimpleNamespace
 
@@ -122,6 +124,7 @@ def configured(monkeypatch):
         fast_backbone_decode=True,
         fast_depth_decoder=False,
         fast_codec=False,
+        continuation_segment_gap_ms=10.0,
     )
     app.state.start_time = time.monotonic()
     monkeypatch.setattr(api_module, "set_all_seeds", lambda _seed: None)
@@ -277,3 +280,50 @@ def test_stream_followup_context_error_is_409_before_response(configured) -> Non
     assert exc_info.value.status_code == 409
     assert configured.closed == ["one"]
     assert app.state.continuations.session is None
+
+
+def test_buffered_followup_prepends_configured_silence() -> None:
+    first = asyncio.run(continuation_speech(_Request(_payload())))
+    second = asyncio.run(continuation_speech(_Request(_payload(input="again"))))
+
+    gap = bytes(24_000 * 10 // 1000 * 2)
+    assert second.body.startswith(gap)
+    assert second.body[len(gap) :] == first.body
+    assert second.headers["x-continuation-gap-ms"] == "10.0"
+
+
+def test_raw_streaming_followup_emits_silence_first() -> None:
+    asyncio.run(continuation_speech(_Request(_payload())))
+    response = asyncio.run(
+        continuation_speech(_Request(_payload(input="again", stream=True)))
+    )
+
+    async def consume() -> list[bytes]:
+        return [part async for part in response.body_iterator]
+
+    parts = asyncio.run(consume())
+    asyncio.run(response.background())
+    assert parts[0] == bytes(24_000 * 10 // 1000 * 2)
+    assert parts[1] == api_module._pcm16(
+        np.array([0.25, -0.25], dtype=np.float32)
+    )
+
+
+def test_sse_followup_emits_silence_as_first_audio_event() -> None:
+    asyncio.run(continuation_speech(_Request(_payload())))
+    response = asyncio.run(
+        continuation_speech(
+            _Request(_payload(input="again", stream=True, stream_format="sse"))
+        )
+    )
+
+    async def consume() -> bytes:
+        return b"".join([part async for part in response.body_iterator])
+
+    body = asyncio.run(consume())
+    asyncio.run(response.background())
+    first_event = json.loads(body.splitlines()[0].removeprefix(b"data: "))
+    assert first_event["type"] == "audio.chunk"
+    assert base64.b64decode(first_event["data"]) == bytes(
+        24_000 * 10 // 1000 * 2
+    )

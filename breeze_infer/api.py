@@ -81,6 +81,7 @@ class ApiSettings:
     fast_codec: bool = False
     continuation_ttl_seconds: float = 30.0
     continuation_mismatch_policy: str = "reject"
+    continuation_segment_gap_ms: float = 120.0
 
 
 _settings: ApiSettings | None = None
@@ -458,7 +459,8 @@ async def cors_middleware(request: Request, call_next):
         response.headers["Access-Control-Allow-Headers"] = "*"
         response.headers["Access-Control-Expose-Headers"] = (
             "X-Sample-Rate, X-Audio-Sample-Rate, X-Request-Id, X-Sample-Format, "
-            "X-Continuation-Id, X-Continuation-Chunk-Index, X-Continuation-Restarted"
+            "X-Continuation-Id, X-Continuation-Chunk-Index, "
+            "X-Continuation-Restarted, X-Continuation-Gap-Ms"
         )
         response.headers["Vary"] = "Origin"
     return response
@@ -1477,6 +1479,16 @@ async def continuation_speech(request: Request):
                 context_safety_frames=CONTEXT_SAFETY_FRAMES,
             )
 
+        segment_gap_ms = (
+            max(
+                0.0,
+                float(getattr(app.state.cfg, "continuation_segment_gap_ms", 120.0)),
+            )
+            if operation == "continue"
+            else 0.0
+        )
+        segment_gap_pcm = bytes(round(sample_rate * segment_gap_ms / 1000.0) * 2)
+
         request_id = f"continuation-api-{uuid.uuid4().hex}"
         chunk_index = managed.runtime_state.chunk_index
 
@@ -1505,7 +1517,8 @@ async def continuation_speech(request: Request):
             nonlocal request_succeeded
             request_succeeded = True
             wall_ms = (time.perf_counter() - started) * 1000.0
-            audio_seconds = pcm_bytes / (2 * sample_rate)
+            output_audio_seconds = pcm_bytes / (2 * sample_rate)
+            audio_seconds = (pcm_bytes - len(segment_gap_pcm)) / (2 * sample_rate)
             app.state.continuations.finish_request(
                 managed,
                 audio_seconds=audio_seconds,
@@ -1522,6 +1535,7 @@ async def continuation_speech(request: Request):
                 "chunk_index": chunk_index,
                 "operation": operation,
                 "restarted": restarted,
+                "segment_gap_ms": segment_gap_ms,
                 "wall_ms": round(wall_ms, 2),
                 "ttfa_ms": (
                     round((first_audio_at - started) * 1000.0, 2)
@@ -1529,6 +1543,7 @@ async def continuation_speech(request: Request):
                     else None
                 ),
                 "audio_seconds": round(audio_seconds, 4),
+                "output_audio_seconds": round(output_audio_seconds, 4),
                 "rtf": round(wall_ms / 1000.0 / audio_seconds, 4),
                 "chunks": chunks,
                 **timing,
@@ -1537,10 +1552,13 @@ async def continuation_speech(request: Request):
         if stream:
             async def stream_body() -> AsyncIterator[bytes]:
                 nonlocal failure_status
-                pcm_bytes = 0
-                chunk_count = 0
+                pcm_bytes = len(segment_gap_pcm)
+                chunk_count = int(bool(segment_gap_pcm))
+                generated_chunk_count = 0
                 first_audio_at: float | None = None
-                pending: bytes | None = None
+                pending: bytes | None = (
+                    segment_gap_pcm if stream_format == "sse" else None
+                )
                 cancel_event = threading.Event()
                 disconnected = False
                 sentinel = object()
@@ -1558,6 +1576,8 @@ async def continuation_speech(request: Request):
                 watcher = asyncio.create_task(watch_disconnect())
                 iterator = runtime_chunks(cancel_event)
                 try:
+                    if segment_gap_pcm and stream_format != "sse":
+                        yield segment_gap_pcm
                     while not cancel_event.is_set():
                         next_chunk = asyncio.create_task(
                             asyncio.to_thread(next, iterator, sentinel)
@@ -1597,13 +1617,14 @@ async def continuation_speech(request: Request):
                         else:
                             yield item
                         chunk_count += 1
+                        generated_chunk_count += 1
                         if disconnected:
                             failure_status = "cancelled"
                             return
                     if disconnected:
                         failure_status = "cancelled"
                         return
-                    if chunk_count == 0:
+                    if generated_chunk_count == 0:
                         raise RuntimeError("Breeze produced an empty audio response")
                     if stream_format == "sse":
                         if pending is not None:
@@ -1628,7 +1649,7 @@ async def continuation_speech(request: Request):
                     record_success(
                         pcm_bytes=pcm_bytes,
                         first_audio_at=first_audio_at,
-                        chunks=chunk_count,
+                        chunks=generated_chunk_count,
                     )
                 except Exception as exc:
                     if isinstance(exc, ContinuationContextError):
@@ -1661,23 +1682,27 @@ async def continuation_speech(request: Request):
                     "X-Continuation-Id": continuation_id,
                     "X-Continuation-Chunk-Index": str(chunk_index),
                     "X-Continuation-Restarted": str(restarted).lower(),
+                    "X-Continuation-Gap-Ms": str(segment_gap_ms),
                 },
                 background=BackgroundTask(finish_request),
             )
 
-        chunks = []
+        generated_chunks = []
         first_audio_at = None
         for chunk in runtime_chunks():
             item = _pcm16(chunk.audio)
             if item:
                 if first_audio_at is None:
                     first_audio_at = time.perf_counter()
-                chunks.append(item)
-        pcm = b"".join(chunks)
-        if not pcm:
+                generated_chunks.append(item)
+        if not generated_chunks:
             raise RuntimeError("Breeze produced an empty audio response")
+        chunks = ([segment_gap_pcm] if segment_gap_pcm else []) + generated_chunks
+        pcm = b"".join(chunks)
         record_success(
-            pcm_bytes=len(pcm), first_audio_at=first_audio_at, chunks=len(chunks)
+            pcm_bytes=len(pcm),
+            first_audio_at=first_audio_at,
+            chunks=len(generated_chunks),
         )
         output = _wav(pcm, sample_rate) if response_format == "wav" else pcm
         return Response(
@@ -1690,6 +1715,7 @@ async def continuation_speech(request: Request):
                 "X-Continuation-Id": continuation_id,
                 "X-Continuation-Chunk-Index": str(chunk_index),
                 "X-Continuation-Restarted": str(restarted).lower(),
+                "X-Continuation-Gap-Ms": str(segment_gap_ms),
             },
         )
     except HTTPException:
@@ -1713,6 +1739,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--continuation-ttl-seconds", type=float, default=30.0)
+    parser.add_argument("--continuation-segment-gap-ms", type=float, default=120.0)
     parser.add_argument(
         "--continuation-mismatch-policy",
         choices=("reject", "fresh_start"),
@@ -1749,6 +1776,7 @@ def main() -> None:
         fast_codec=args.fast_codec,
         continuation_ttl_seconds=args.continuation_ttl_seconds,
         continuation_mismatch_policy=args.continuation_mismatch_policy,
+        continuation_segment_gap_ms=args.continuation_segment_gap_ms,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

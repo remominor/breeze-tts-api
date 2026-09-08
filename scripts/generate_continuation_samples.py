@@ -71,6 +71,7 @@ SAMPLES = (
         ),
     ),
 )
+SEGMENT_GAP_MS = 120
 
 
 def _write_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:
@@ -151,6 +152,13 @@ def main() -> None:
         started = time.perf_counter()
         try:
             for segment_index, text in enumerate(segments):
+                if segment_index:
+                    parts.append(
+                        np.zeros(
+                            round(runtime.sample_rate * SEGMENT_GAP_MS / 1000.0),
+                            dtype=np.float32,
+                        )
+                    )
                 estimated = estimate_speech_frames(tokenizer, text)
                 iterator = (
                     continuation.iter_start(
@@ -178,6 +186,7 @@ def main() -> None:
                 "voice": voice,
                 "instruction": instruction,
                 "segments": len(segments),
+                "segment_gap_ms": SEGMENT_GAP_MS,
                 "audio_seconds": round(audio_seconds, 2),
                 "rtf": round(wall_seconds / audio_seconds, 4),
             }
