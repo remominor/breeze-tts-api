@@ -324,6 +324,18 @@ def test_buffered_followup_prepends_configured_silence() -> None:
     assert second.headers["x-continuation-gap-ms"] == "10.0"
 
 
+def test_continuation_gap_uses_continuation_codec_sample_rate(configured) -> None:
+    # The retained continuation runtime is authoritative for generated PCM;
+    # the general runtime rate must not affect the inserted silence length.
+    app.state.runtime.sample_rate = 48_000
+    asyncio.run(continuation_speech(_Request(_payload())))
+    second = asyncio.run(continuation_speech(_Request(_payload(input="again"))))
+
+    expected_gap = bytes(24_000 * 10 // 1000 * 2)
+    assert second.body.startswith(expected_gap)
+    assert second.headers["x-sample-rate"] == "24000"
+
+
 def test_raw_streaming_followup_emits_silence_first() -> None:
     asyncio.run(continuation_speech(_Request(_payload())))
     response = asyncio.run(

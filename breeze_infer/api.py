@@ -111,6 +111,12 @@ def _pcm16(audio: np.ndarray) -> bytes:
     return (values * 32767.0).astype("<i2", copy=False).tobytes()
 
 
+def _silence_pcm(duration_ms: float, sample_rate: int) -> bytes:
+    """Return exact mono signed-16 PCM silence at the codec output rate."""
+    sample_count = max(0, round(sample_rate * duration_ms / 1000.0))
+    return np.zeros(sample_count, dtype="<i2").tobytes()
+
+
 def _wav(pcm: bytes, sample_rate: int) -> bytes:
     import struct
 
@@ -1441,7 +1447,9 @@ async def continuation_speech(request: Request):
         if stream_format not in {"audio", "sse"}:
             raise HTTPException(422, "stream_format must be audio or sse")
         stream = _parse_stream(form.get("stream", False)) or stream_format == "sse"
-        sample_rate = app.state.runtime.sample_rate
+        # Continuation owns the codec runtime. Use its rate for framing and
+        # inserted PCM so the boundary bytes match the retained decoder output.
+        sample_rate = app.state.continuations.runtime.sample_rate
         fingerprint = ContinuationFingerprint(
             voice_identity=str(ref_request.get("profile_id") or "voice-design"),
             effective_ref_text=ref_request.get("ref_text"),
@@ -1523,7 +1531,7 @@ async def continuation_speech(request: Request):
             if operation == "continue"
             else 0.0
         )
-        segment_gap_pcm = bytes(round(sample_rate * segment_gap_ms / 1000.0) * 2)
+        segment_gap_pcm = _silence_pcm(segment_gap_ms, sample_rate)
 
         request_id = f"continuation-api-{uuid.uuid4().hex}"
         chunk_index = managed.runtime_state.chunk_index
