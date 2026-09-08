@@ -107,6 +107,18 @@ def test_ttl_expires_only_idle_state() -> None:
     assert manager.session is None
 
 
+def test_unstarted_stream_reservation_expires_without_blocking_forever() -> None:
+    runtime = _Runtime()
+    manager = ContinuationManager(runtime, pending_stream_timeout_seconds=5)
+    state = manager.start("one", _fingerprint(), {})
+    state.in_flight_since = 10
+
+    assert manager.expire(now=14) is False
+    assert manager.expire(now=15) is True
+    assert manager.session is None
+    assert runtime.closed == ["one"]
+
+
 def test_normal_cleanup_closes_idle_state() -> None:
     runtime = _Runtime()
     manager = ContinuationManager(runtime)

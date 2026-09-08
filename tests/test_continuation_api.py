@@ -240,7 +240,7 @@ def test_stream_releases_request_lock_but_retains_session() -> None:
     response = asyncio.run(
         continuation_speech(_Request(_payload(stream=True, response_format="pcm")))
     )
-    assert api_module._request_lock.locked()
+    assert not api_module._request_lock.locked()
 
     async def consume() -> bytes:
         parts = []
@@ -254,6 +254,29 @@ def test_stream_releases_request_lock_but_retains_session() -> None:
     assert not api_module._request_lock.locked()
     assert app.state.continuations.session is not None
     assert app.state.continuations.session.in_flight is False
+
+
+def test_unstarted_stream_does_not_hold_lock_and_expires(configured) -> None:
+    asyncio.run(continuation_speech(_Request(_payload(stream=True))))
+    pending = app.state.continuations.session
+
+    assert pending.in_flight is True
+    assert pending.stream_started is False
+    assert not api_module._request_lock.locked()
+    pending.in_flight_since = 0.0
+    assert app.state.continuations.expire(now=10.0) is True
+    assert configured.closed == ["one"]
+    assert app.state.continuations.session is None
+
+
+def test_normal_request_rejects_pending_continuation_without_holding_lock() -> None:
+    asyncio.run(continuation_speech(_Request(_payload(stream=True))))
+
+    with pytest.raises(HTTPException, match="continuation request") as exc_info:
+        asyncio.run(speech(_Request({"input": "normal", "response_format": "pcm"})))
+
+    assert exc_info.value.status_code == 409
+    assert not api_module._request_lock.locked()
 
 
 def test_stream_disconnect_after_audio_invalidates_session(configured) -> None:

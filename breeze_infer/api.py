@@ -27,6 +27,7 @@ from starlette.background import BackgroundTask
 
 from breeze_infer.audio import encode_prompt_audio
 from breeze_infer.continuation import (
+    ContinuationBusyError,
     ContinuationFingerprint,
     ContinuationManager,
     ContinuationMismatchError,
@@ -937,7 +938,10 @@ async def speech(request: Request):
         except Exception as exc:
             logger.exception("Breeze model load failed while serving request")
             raise HTTPException(500, f"Model load failed: {exc}") from exc
-        _cleanup_idle_continuation()
+        try:
+            _cleanup_idle_continuation()
+        except ContinuationBusyError as exc:
+            raise HTTPException(409, "A continuation request is pending or running.") from exc
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
             form = await request.json()
@@ -1335,22 +1339,40 @@ async def continuation_speech(request: Request):
 
     started = time.perf_counter()
     finish_guard = threading.Lock()
-    lock_released = False
+    lock_held = True
+    finished = False
     managed = None
     request_succeeded = False
     failure_status = "failed"
     handoff = False
 
     def finish_request() -> None:
-        nonlocal lock_released
+        nonlocal finished, lock_held
         with finish_guard:
-            if lock_released:
+            if finished:
                 return
-            lock_released = True
+            finished = True
             if managed is not None and not request_succeeded:
                 app.state.continuations.fail_request(managed)
                 _record_closed_continuation(managed, failure_status)
-            _request_lock.release()
+            if lock_held:
+                _request_lock.release()
+                lock_held = False
+
+    def release_request_lock() -> None:
+        nonlocal lock_held
+        with finish_guard:
+            if lock_held:
+                _request_lock.release()
+                lock_held = False
+
+    def acquire_stream_lock() -> bool:
+        nonlocal lock_held
+        with finish_guard:
+            if finished or not _request_lock.acquire(blocking=False):
+                return False
+            lock_held = True
+            return True
 
     try:
         try:
@@ -1437,6 +1459,9 @@ async def continuation_speech(request: Request):
             operation, restarted = app.state.continuations.classify(
                 continuation_id, fingerprint
             )
+        except ContinuationBusyError as exc:
+            continuation_metrics["busy_rejections"] += 1
+            raise HTTPException(409, str(exc)) from exc
         except ContinuationMismatchError as exc:
             continuation_metrics["mismatches"] += 1
             raise HTTPException(409, str(exc)) from exc
@@ -1563,6 +1588,16 @@ async def continuation_speech(request: Request):
         if stream:
             async def stream_body() -> AsyncIterator[bytes]:
                 nonlocal failure_status
+                if not acquire_stream_lock():
+                    failure_status = "failed"
+                    finish_request()
+                    if stream_format == "sse":
+                        yield b'data: {"type":"error","error":"inference busy"}\n\n'
+                    return
+                if not app.state.continuations.begin_stream(managed):
+                    failure_status = "cancelled"
+                    finish_request()
+                    return
                 pcm_bytes = len(segment_gap_pcm)
                 chunk_count = int(bool(segment_gap_pcm))
                 generated_chunk_count = 0
@@ -1680,6 +1715,7 @@ async def continuation_speech(request: Request):
                     finish_request()
 
             media = "text/event-stream" if stream_format == "sse" else "audio/pcm"
+            release_request_lock()
             handoff = True
             return StreamingResponse(
                 stream_body(),

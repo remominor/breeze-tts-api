@@ -65,6 +65,8 @@ class ManagedContinuation:
     fingerprint: ContinuationFingerprint
     runtime_state: ContinuationRuntimeSession
     in_flight: bool = False
+    stream_started: bool = False
+    in_flight_since: float = 0.0
     successful_chunks: int = 0
     total_audio_seconds: float = 0.0
     total_wall_seconds: float = 0.0
@@ -89,14 +91,18 @@ class ContinuationManager:
         *,
         ttl_seconds: float = 30.0,
         mismatch_policy: MismatchPolicy = "reject",
+        pending_stream_timeout_seconds: float = 5.0,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("continuation TTL must be greater than zero")
         if mismatch_policy not in {"reject", "fresh_start"}:
             raise ValueError("continuation mismatch policy must be reject or fresh_start")
+        if pending_stream_timeout_seconds <= 0:
+            raise ValueError("pending stream timeout must be greater than zero")
         self.runtime = runtime
         self.ttl_seconds = float(ttl_seconds)
         self.mismatch_policy = mismatch_policy
+        self.pending_stream_timeout_seconds = float(pending_stream_timeout_seconds)
         self._session: ManagedContinuation | None = None
         self._lock = threading.RLock()
 
@@ -137,6 +143,7 @@ class ContinuationManager:
                 fingerprint=fingerprint,
                 runtime_state=self.runtime.new_session(continuation_id, inputs),
                 in_flight=True,
+                in_flight_since=time.monotonic(),
             )
             self._session = managed
             return managed
@@ -149,7 +156,17 @@ class ContinuationManager:
             if current.in_flight:
                 raise ContinuationBusyError("continuation inference is already running")
             current.in_flight = True
+            current.stream_started = False
+            current.in_flight_since = time.monotonic()
             return current
+
+    def begin_stream(self, managed: ManagedContinuation) -> bool:
+        """Mark a reserved request as actually entering its response body."""
+        with self._lock:
+            if self._session is not managed or not managed.in_flight:
+                return False
+            managed.stream_started = True
+            return True
 
     def finish_request(
         self,
@@ -162,6 +179,7 @@ class ContinuationManager:
             if self._session is not managed:
                 return
             managed.in_flight = False
+            managed.stream_started = False
             managed.successful_chunks += 1
             managed.total_audio_seconds += float(audio_seconds)
             managed.total_wall_seconds += float(wall_seconds)
@@ -184,9 +202,18 @@ class ContinuationManager:
     def expire(self, now: float | None = None) -> bool:
         with self._lock:
             current = self._session
-            if current is None or current.in_flight:
+            if current is None:
                 return False
             now = time.monotonic() if now is None else now
+            if current.in_flight:
+                if (
+                    not current.stream_started
+                    and now - current.in_flight_since
+                    >= self.pending_stream_timeout_seconds
+                ):
+                    self._close_locked()
+                    return True
+                return False
             if now - current.runtime_state.last_used_at < self.ttl_seconds:
                 return False
             self._close_locked()
