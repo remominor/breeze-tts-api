@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import random
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -17,63 +16,112 @@ from models.breeze_config import BreezeConfig
 
 logger = logging.getLogger(__name__)
 
+HYBRID_FP32_TENSORS = frozenset(
+    {
+        "lm_head.weight",
+        "depth_decoder.codebooks_head.weight",
+    }
+)
+HYBRID_OMITTED_PREFIXES = ("codec_model.", "embed_text_tokens.")
+HYBRID_SCALE_MODES = frozenset({"bf16_compat", "exact_fp32"})
 
-@contextmanager
-def _suppress_hybrid_quant_notice():
-    """Hide Transformers' expected report for ConvRot metadata tensors only."""
-    from transformers.utils import logging as transformers_logging
 
-    # Accelerate emits this notice while dispatching the checkpoint; some
-    # Transformers versions emit the equivalent message themselves.
-    checkpoint_loggers = [
-        logging.getLogger("accelerate.utils.modeling"),
-        logging.getLogger("transformers.modeling_utils"),
-    ]
-    previous_verbosity = transformers_logging.get_verbosity()
+def _validate_hybrid_scale_mode(scale_mode: str) -> str:
+    if scale_mode not in HYBRID_SCALE_MODES:
+        choices = ", ".join(sorted(HYBRID_SCALE_MODES))
+        raise ValueError(f"Unknown hybrid scale mode {scale_mode!r}; expected one of {choices}")
+    return scale_mode
 
-    class _ExpectedQuantFilter(logging.Filter):
-        def filter(self, record: logging.LogRecord) -> bool:
-            message = record.getMessage()
-            return not (
-                "Some weights of the model checkpoint" in message
-                and "were not used when" in message
-                and ".comfy_quant" in message
+
+def _hybrid_target_dtype(name: str, tensor: torch.Tensor) -> torch.dtype:
+    """Return the on-device dtype for one hybrid-checkpoint tensor."""
+    if name.endswith(".weight_scale"):
+        if tensor.dtype != torch.float32:
+            raise RuntimeError(
+                f"ConvRot scale {name} must be FP32 in the checkpoint, got {tensor.dtype}"
             )
+        return tensor.dtype
+    if name in HYBRID_FP32_TENSORS:
+        return torch.float32
+    if tensor.is_floating_point():
+        return torch.bfloat16
+    return tensor.dtype
 
-    quant_filter = _ExpectedQuantFilter()
-    original_warnings = []
-    for checkpoint_logger in checkpoint_loggers:
-        original_warning = checkpoint_logger.warning
 
-        def warning(message: object, *args: object, _original=original_warning, **kwargs: object) -> None:
-            rendered = str(message)
-            if args:
-                try:
-                    rendered = rendered % args
-                except (TypeError, ValueError):
-                    pass
-            if (
-                "Some weights of the model checkpoint" in rendered
-                and "were not used when" in rendered
-                and ".comfy_quant" in rendered
-            ):
-                return
-            _original(message, *args, **kwargs)
+def _hybrid_tensor_value(
+    name: str, tensor: torch.Tensor, *, scale_mode: str
+) -> torch.Tensor:
+    """Apply the checkpoint-specific ConvRot scale compatibility policy."""
+    scale_mode = _validate_hybrid_scale_mode(scale_mode)
+    if name.endswith(".weight_scale") and scale_mode == "bf16_compat":
+        # Legacy hybrid loading first converted all floating checkpoint tensors
+        # to BF16, then promoted ConvRot scales back to FP32 for the kernel.
+        # Retain that numerically stable trajectory without changing the FP32
+        # scale storage required by comfy_kitchen.int8_linear.
+        return tensor.to(torch.bfloat16).float()
+    return tensor
 
-        checkpoint_logger.addFilter(quant_filter)
-        checkpoint_logger.warning = warning  # type: ignore[method-assign]
-        original_warnings.append((checkpoint_logger, original_warning))
-    # Transformers' logging setup can replace or bypass individual logger
-    # filters.  The dispatch is a short, known-safe window, so also use its
-    # official global verbosity control and restore it immediately afterwards.
-    transformers_logging.set_verbosity_error()
-    try:
-        yield
-    finally:
-        transformers_logging.set_verbosity(previous_verbosity)
-        for checkpoint_logger, original_warning in original_warnings:
-            checkpoint_logger.warning = original_warning  # type: ignore[method-assign]
-            checkpoint_logger.removeFilter(quant_filter)
+
+def _load_hybrid_checkpoint(
+    model: torch.nn.Module,
+    checkpoint: Path,
+    *,
+    device: str,
+    scale_mode: str = "bf16_compat",
+) -> dict[str, int | str]:
+    """Stream a hybrid safetensors checkpoint into an already-built meta model."""
+    from accelerate.utils.modeling import set_module_tensor_to_device
+    from safetensors import safe_open
+
+    scale_mode = _validate_hybrid_scale_mode(scale_mode)
+    model_keys = set(model.state_dict().keys())
+    loaded: set[str] = set()
+    ignored = 0
+    quant_metadata = 0
+
+    with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
+        for name in handle.keys():  # noqa: SIM118 - safe_open is not iterable
+            if name.endswith(".comfy_quant"):
+                quant_metadata += 1
+                continue
+            if name.startswith(HYBRID_OMITTED_PREFIXES):
+                ignored += 1
+                continue
+            if name not in model_keys:
+                raise RuntimeError(f"Unexpected tensor in hybrid checkpoint: {name}")
+
+            tensor = handle.get_tensor(name)
+            value = _hybrid_tensor_value(name, tensor, scale_mode=scale_mode)
+            set_module_tensor_to_device(
+                model,
+                name,
+                device=device,
+                value=value.contiguous(),
+                dtype=_hybrid_target_dtype(name, tensor),
+            )
+            loaded.add(name)
+
+    tied_audio_embedding = "backbone_model.embed_tokens.embed_audio_tokens.weight"
+    if (
+        getattr(model.config, "tie_codebooks_embeddings", False)
+        and tied_audio_embedding in model_keys
+        and tied_audio_embedding not in loaded
+    ):
+        model.tie_weights()
+        loaded.add(tied_audio_embedding)
+
+    missing = sorted(model_keys - loaded)
+    if missing:
+        raise RuntimeError(
+            f"Hybrid checkpoint is missing {len(missing)} model tensor(s): {missing[:8]}"
+        )
+
+    return {
+        "loaded_tensors": len(loaded),
+        "ignored_tensors": ignored,
+        "quant_metadata": quant_metadata,
+        "scale_mode": scale_mode,
+    }
 
 
 def _load_breeze_tokenizer(ckpt_dir: Path) -> AutoTokenizer:
@@ -81,19 +129,6 @@ def _load_breeze_tokenizer(ckpt_dir: Path) -> AutoTokenizer:
     # Mistral-only regex migration is therefore inapplicable and, with the
     # tokenizers version in our supported stack, can raise a TypeError.
     return AutoTokenizer.from_pretrained(ckpt_dir, fix_mistral_regex=False)
-
-
-@contextmanager
-def _suppress_accelerate_checkpoint_progress():
-    """Keep the service's one-time checkpoint load out of its API logs."""
-    import accelerate.utils.modeling as accelerate_modeling
-
-    original = accelerate_modeling.is_tqdm_available
-    accelerate_modeling.is_tqdm_available = lambda: False
-    try:
-        yield
-    finally:
-        accelerate_modeling.is_tqdm_available = original
 
 
 def get_dist_info() -> tuple[int, int, int]:
@@ -155,6 +190,7 @@ def load_runtime(
     device: str,
     attn_implementation: str,
     weights_path: Path | None = None,
+    hybrid_scale_mode: str = "bf16_compat",
 ) -> tuple[AutoTokenizer, BreezeForConditionalGeneration, Any]:
 
     if weights_path is not None:
@@ -183,9 +219,10 @@ def load_runtime(
         )
         model.to(device)
     else:
-        from accelerate import init_empty_weights, load_checkpoint_in_model
+        from accelerate import init_empty_weights
 
         from breeze_infer.int8_convrot import (
+            ConvRotInt8Linear,
             model_quantization_stats,
             replace_quantized_linears,
             scan_checkpoint_quantization,
@@ -211,45 +248,40 @@ def load_runtime(
         replaced = replace_quantized_linears(model, quant_map)
         if len(replaced) != len(quant_map):
             raise RuntimeError(f"Only {len(replaced)}/{len(quant_map)} quantized prefixes matched")
-        # Accelerate otherwise maps every safetensors entry directly to CUDA
-        # before noticing that the lean model has no matching parameter. Keep
-        # those intentionally omitted tensors on CPU during staging so its
-        # caching allocator does not retain their 1.2 GiB GPU allocation.
-        # Do not include a catch-all CUDA mapping: Accelerate would then map
-        # the omitted checkpoint entries to both CUDA and CPU while staging.
-        # Unmapped entries fall back to CPU; every module retained by the lean
-        # model is named here and is loaded directly to the target GPU.
-        staging_device_map = {
-            "backbone_model": device,
-            "depth_decoder": device,
-            "text_encoder": device,
-            "text_encoder_proj": device,
-            "lm_head": device,
-            # Retain an explicit CPU entry so Accelerate takes its per-prefix
-            # safetensors path instead of its one-device shortcut, which would
-            # stage every checkpoint tensor on CUDA.
-            "codec_model": "cpu",
-        }
-        with _suppress_hybrid_quant_notice(), _suppress_accelerate_checkpoint_progress():
-            load_checkpoint_in_model(
-                model, str(weights_path), device_map=staging_device_map, dtype=torch.bfloat16,
-                strict=False, full_state_dict=True,
-            )
-        # ``load_checkpoint_in_model`` places checkpoint tensors but does not
-        # dispatch non-persistent constructor buffers (RoPE frequencies and
-        # audio token offsets). Move those small buffers with the model before
-        # CUDA-graph warmup.
+        load_stats = _load_hybrid_checkpoint(
+            model,
+            weights_path,
+            device=device,
+            scale_mode=hybrid_scale_mode,
+        )
+        # Streamed checkpoint placement does not dispatch non-persistent
+        # constructor buffers (RoPE frequencies and audio token offsets). Move
+        # those small buffers with the model before CUDA-graph warmup.
         model.to(device)
-        # ConvRot scales are consumed as FP32 by comfy-kitchen.  The dispatch
-        # dtype policy above intentionally materializes ordinary model weights
-        # as BF16, so restore this quantization metadata dtype explicitly.
-        for module in model.modules():
-            if hasattr(module, "weight_scale"):
-                module.weight_scale.data = module.weight_scale.data.float()
+        if model.lm_head.weight.dtype != torch.float32:
+            raise RuntimeError(
+                f"lm_head.weight loaded as {model.lm_head.weight.dtype}, expected FP32"
+            )
+        if model.depth_decoder.codebooks_head.weight.dtype != torch.float32:
+            raise RuntimeError(
+                "depth_decoder.codebooks_head.weight loaded as "
+                f"{model.depth_decoder.codebooks_head.weight.dtype}, expected FP32"
+            )
+        for name, module in model.named_modules():
+            if not isinstance(module, ConvRotInt8Linear):
+                continue
+            if module.weight.dtype != torch.int8:
+                raise RuntimeError(
+                    f"{name}.weight loaded as {module.weight.dtype}, expected INT8"
+                )
+            if module.weight_scale.dtype != torch.float32:
+                raise RuntimeError(
+                    f"{name}.weight_scale loaded as {module.weight_scale.dtype}, expected FP32"
+                )
         stats = model_quantization_stats(model)
         if stats["meta_parameters"]:
             raise RuntimeError(f"INT8 model has {stats['meta_parameters']} parameters left on meta")
-        logger.info("loaded ConvRot INT8 model: %s", stats)
+        logger.info("loaded ConvRot INT8 model: load=%s model=%s", load_stats, stats)
     model.eval()
 
     from qwen_tts import Qwen3TTSTokenizer

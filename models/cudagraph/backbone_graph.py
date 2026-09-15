@@ -99,6 +99,12 @@ class BackboneGraph:
         self.attn_mask = None
         # Per-batch left-padding lengths for vectorized mask construction
         self._pad_lens = torch.zeros(self.batch_size, dtype=torch.long, device=device)
+        # Physical KV slots populated by meaningful tokens.  Most requests use
+        # a contiguous range after left padding, but continuation CFG appends
+        # can have different per-branch lengths and therefore leave holes.
+        self._valid_kv_mask = torch.zeros(
+            self.batch_size, max_seq_len, dtype=torch.bool, device=device
+        )
         # Pre-allocated index range [0, 1, ..., max_seq_len-1] for broadcasting
         self._kv_indices = torch.arange(max_seq_len, dtype=torch.long, device=device)
 
@@ -162,6 +168,9 @@ class BackboneGraph:
         self.graph = None
         self.attn_mask = None
         self._pad_lens = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        self._valid_kv_mask = torch.zeros(
+            batch_size, self.max_seq_len, dtype=torch.bool, device=self.device
+        )
         self._kv_indices = torch.arange(
             self.max_seq_len, dtype=torch.long, device=self.device
         )
@@ -246,10 +255,11 @@ class BackboneGraph:
 
         attn_mask shape: [batch, 1, 1, max_seq_len]
         """
-        # kv_indices: [max_seq_len], pad_lens: [batch, 1], position: scalar
+        # kv_indices: [max_seq_len], valid slots: [batch, max_seq_len].
+        # ``_valid_kv_mask`` generalizes the usual contiguous post-padding
+        # range for continuation appends with per-branch padding holes.
         kv = self._kv_indices  # [S]
-        lo = self._pad_lens.unsqueeze(1)  # [B, 1]
-        valid = (kv >= lo) & (kv <= position)  # [B, S]
+        valid = self._valid_kv_mask & (kv.unsqueeze(0) <= position)
         self.attn_mask.fill_(self._mask_min_val)
         self.attn_mask[:, 0, 0, :].masked_fill_(valid, 0.0)
 
@@ -325,6 +335,7 @@ class BackboneGraph:
     def reset(self):
         """Reset cache for new sequence."""
         self.static_cache.reset()
+        self._valid_kv_mask.zero_()
 
     @torch.inference_mode()
     def finish_direct_prefill(self, seq_len: int) -> int:
@@ -371,8 +382,15 @@ class BackboneGraph:
             # pad_lens[i] = seq_len - num_valid_tokens[i]
             seq_len = attention_mask.shape[1]
             self._pad_lens.copy_(seq_len - per_batch_pos)
+            self._valid_kv_mask.zero_()
+            physical = torch.arange(self.max_seq_len, device=self.device)
+            self._valid_kv_mask.copy_(
+                (physical.unsqueeze(0) >= self._pad_lens.unsqueeze(1))
+                & (physical.unsqueeze(0) < seq_len)
+            )
         else:
             self._pad_lens.zero_()
+            self._valid_kv_mask.zero_()
 
     @torch.inference_mode()
     def run(self, input_ids, step_idx):
@@ -387,6 +405,7 @@ class BackboneGraph:
         self.position_ids.copy_((self._base_position + step_idx).unsqueeze(-1))
         # KV cache slot: prefill_len + step_idx (append after prefill KV, never overwrite)
         self.cache_position[0] = self._prefill_len + step_idx
+        self._valid_kv_mask[:, self.cache_position[0]] = True
         self._set_attention_mask(self.cache_position[0].item())
         if self.no_graph:
             self._decode_step()
@@ -397,3 +416,16 @@ class BackboneGraph:
                 # Result is discarded — only hook side-effects matter.
                 self.lm_head(self.hidden_buf[:, -1, :].float())
         return self.hidden_buf, self.cfg_logits_buf
+
+    @torch.inference_mode()
+    def combine_logits(self, guidance_scale: float) -> torch.Tensor:
+        """Apply a runtime CFG scale to the most recently decoded raw logits.
+
+        This is used only by the continuation CFG-ramp diagnostic.  The normal
+        graph path continues to return its captured ``cfg_logits_buf``.
+        """
+        if self.batch_size < 2:
+            return self.logits_buf[:1]
+        cond_logits = self.logits_buf[: self.half]
+        uncond_logits = self.logits_buf[self.half :]
+        return uncond_logits + float(guidance_scale) * (cond_logits - uncond_logits)

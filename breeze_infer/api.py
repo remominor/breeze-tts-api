@@ -42,6 +42,7 @@ from breeze_infer.observability import (
 )
 from breeze_infer.profiles import ProfileExistsError, ProfileNotFoundError, ProfileStore
 from breeze_infer.runtime import (
+    HYBRID_SCALE_MODES,
     load_runtime,
     resolve_device,
     set_all_seeds,
@@ -62,7 +63,6 @@ DEFAULT_CFG_SCALE = 1.0
 MAX_NEW_TOKENS = 1500
 MAX_SEQ_LEN = 2048
 REPETITION_PENALTY = 1.1
-DEFAULT_INSTRUCTION = "Speak clearly and naturally."
 CONTEXT_SAFETY_FRAMES = 64
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,7 @@ logger = logging.getLogger(__name__)
 class ApiSettings:
     model: Path
     weights: Path | None = None
+    hybrid_scale_mode: str = "bf16_compat"
     voice_dir: Path = Path.home() / ".local/share/breeze-tts/voices"
     max_ref_audio_bytes: int = 25 * 1024 * 1024
     cors_origins: tuple[str, ...] = ("http://localhost:7860", "http://127.0.0.1:7860")
@@ -236,15 +237,10 @@ def _normalise_instruction_for_cfg(
     instruction: str,
     cfg_value: object,
 ) -> tuple[str, float]:
-    """Return a valid instruction/CFG pairing for the Breeze templates.
-
-    CFG needs both conditional and negative prompt branches.  The plain and
-    clone templates deliberately have no negative branch, so an empty design
-    instruction together with CFG > 1 used to reach ``prepare_inputs`` as an
-    invalid combination.  Treat a blank instruction as a request for the
-    neutral instruction in that case. CFG=1 is a true conditional-only path;
-    it must not be silently promoted to a guided request.
-    """
+    """Normalize instruction content and return a template-valid CFG pairing."""
+    instruction = instruction.strip()
+    if not any(character.isalpha() for character in instruction):
+        instruction = ""
     try:
         scale = (
             float(cfg_value)
@@ -257,8 +253,11 @@ def _normalise_instruction_for_cfg(
         raise HTTPException(
             422, "guidance_scale/cfg_scale must be finite and greater than 0"
         )
-    if not instruction and scale != 1.0:
-        return DEFAULT_INSTRUCTION, scale
+    # Plain TTS and Voice Clone have no negative prompt branch, so CFG cannot
+    # be applied without changing the request into Design or Direction. Keep
+    # the user's intended mode and fall back to its valid conditional path.
+    if not instruction:
+        return "", 1.0
     return instruction, scale
 
 
@@ -269,6 +268,7 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
         device=resolve_device(),
         attn_implementation="eager",
         weights_path=settings.weights,
+        hybrid_scale_mode=settings.hybrid_scale_mode,
     )
     update_generation_config_for_breeze(model)
     runtime = FastBreezeStreamingRuntime(
@@ -988,6 +988,8 @@ async def speech(request: Request):
         ref_request, template_name = _profile_request(
             app.state.profiles, voice, ref_text=ref_text, instruction=instruction
         )
+        if ref_text and not hasattr(upload, "read") and not ref_request.get("profile_id"):
+            raise HTTPException(422, "ref_audio is required with ref_text")
         if hasattr(upload, "read"):
             data = await _upload_bytes(upload, app.state.cfg.max_ref_audio_bytes)
             if not ref_text:
@@ -1013,9 +1015,6 @@ async def speech(request: Request):
                     ref_request["profile_id"], reference_codes
                 )
         ref_request.update(id=uuid.uuid4().hex, instruction=instruction, speaker="S0")
-        # The bundled low-VRAM fast profile warms the CFG branch.  The
-        # normaliser above supplies the neutral instruction for an automatic
-        # request and for any explicit CFG value that otherwise lacks one.
         seed = _parse_seed(form.get("seed", 42))
         set_all_seeds(seed)
 
@@ -1486,6 +1485,8 @@ async def continuation_speech(request: Request):
             ref_text=ref_text,
             instruction=instruction,
         )
+        if ref_text and not ref_request.get("profile_id"):
+            raise HTTPException(422, "ref_audio is required with ref_text")
         if ref_request.get("ref_audio_path"):
             codes = encode_prompt_audio(
                 app.state.audio_tokenizer, Path(ref_request["ref_audio_path"])
@@ -1880,6 +1881,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Serve Breeze TTS 2")
     parser.add_argument("model", type=Path)
     parser.add_argument("--weights", type=Path)
+    parser.add_argument(
+        "--hybrid-scale-mode",
+        choices=sorted(HYBRID_SCALE_MODES),
+        default="bf16_compat",
+        help="ConvRot scale-value policy for hybrid weights.",
+    )
     parser.add_argument("--voice-dir", type=Path, default=ApiSettings.voice_dir)
     parser.add_argument("--max-ref-audio-mb", type=int, default=25)
     parser.add_argument("--cors-origins", default=",".join(ApiSettings.cors_origins))
@@ -1910,6 +1917,7 @@ def main() -> None:
     _settings = ApiSettings(
         model=args.model,
         weights=args.weights,
+        hybrid_scale_mode=args.hybrid_scale_mode,
         voice_dir=args.voice_dir,
         max_ref_audio_bytes=args.max_ref_audio_mb * 1024 * 1024,
         cors_origins=tuple(

@@ -14,7 +14,6 @@ from fastapi import HTTPException
 
 from breeze_infer.api import (
     DEFAULT_CFG_SCALE,
-    DEFAULT_INSTRUCTION,
     _lifespan,
     _normalise_instruction_for_cfg,
     _parse_seed,
@@ -54,6 +53,22 @@ class _JsonRequest:
 
     async def is_disconnected(self) -> bool:
         return False
+
+
+class _FormRequest(_JsonRequest):
+    def __init__(self, body: dict):
+        super().__init__(body)
+        self.headers = {"content-type": "multipart/form-data"}
+
+    async def form(self) -> dict:
+        return self.body
+
+
+class _Upload:
+    filename = "reference.wav"
+
+    async def read(self, _limit: int) -> bytes:
+        return b"audio"
 
 
 class _Tokenizer:
@@ -122,11 +137,11 @@ def test_api_cfg_defaults_to_one() -> None:
     assert DEFAULT_CFG_SCALE == 1.0
 
 
-def test_explicit_cfg_without_direction_uses_neutral_instruction() -> None:
-    instruction, scale = _normalise_instruction_for_cfg("", "4")
-
-    assert instruction == DEFAULT_INSTRUCTION
-    assert scale == 4.0
+@pytest.mark.parametrize("instruction", ["", "   ", ".", "!? —", "123"])
+def test_cfg_without_alphabetic_instruction_falls_back_to_plain_cfg_one(
+    instruction: str,
+) -> None:
+    assert _normalise_instruction_for_cfg(instruction, "4") == ("", 1.0)
 
 
 def test_cfg_one_without_direction_remains_plain() -> None:
@@ -141,6 +156,15 @@ def test_automatic_request_defaults_to_plain_cfg_one() -> None:
 
     assert instruction == ""
     assert scale == 1.0
+
+
+@pytest.mark.parametrize("instruction", ["b", "你好", "... calm ..."])
+def test_alphabetic_instruction_remains_valid(instruction: str) -> None:
+    assert _normalise_instruction_for_cfg(instruction, "2.5") == (instruction, 2.5)
+
+
+def test_valid_instruction_defaults_to_cfg_four() -> None:
+    assert _normalise_instruction_for_cfg("Calm", None) == ("Calm", 4.0)
 
 
 @pytest.mark.parametrize("text", [".", "...", "!? —"])
@@ -166,6 +190,26 @@ def test_speech_rejects_punctuation_only_text_before_generation(monkeypatch) -> 
                 )
             )
         )
+
+    assert exc_info.value.status_code == 422
+
+
+def test_speech_rejects_reference_text_without_reference_audio(monkeypatch) -> None:
+    _configure_fake_speech_state(monkeypatch)
+
+    with pytest.raises(HTTPException, match="ref_audio is required") as exc_info:
+        asyncio.run(
+            speech(_JsonRequest({"input": "hello", "reference_text": "reference"}))
+        )
+
+    assert exc_info.value.status_code == 422
+
+
+def test_speech_rejects_reference_audio_without_reference_text(monkeypatch) -> None:
+    _configure_fake_speech_state(monkeypatch)
+
+    with pytest.raises(HTTPException, match="ref_text is required") as exc_info:
+        asyncio.run(speech(_FormRequest({"input": "hello", "ref_audio": _Upload()})))
 
     assert exc_info.value.status_code == 422
 

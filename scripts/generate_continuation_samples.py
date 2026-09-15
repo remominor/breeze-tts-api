@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import time
 import uuid
@@ -9,10 +10,15 @@ import wave
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from breeze_infer.audio import encode_prompt_audio
 from breeze_infer.profiles import ProfileStore
-from breeze_infer.runtime import load_runtime, update_generation_config_for_breeze
+from breeze_infer.runtime import (
+    HYBRID_SCALE_MODES,
+    load_runtime,
+    update_generation_config_for_breeze,
+)
 from breeze_infer.templates import get_template, prepare_inputs
 from breeze_infer.text_chunks import estimate_speech_frames
 from models.continuation_streaming import ContinuationStreamingRuntime
@@ -84,13 +90,47 @@ def _write_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--voice", choices=[sample[0] for sample in SAMPLES])
+    parser.add_argument("--output-dir", type=Path, default=Path("."))
+    parser.add_argument(
+        "--original-weights",
+        action="store_true",
+        help="Load the original sharded BF16 checkpoint instead of ConvRot INT8.",
+    )
+    parser.add_argument(
+        "--hybrid-scale-mode",
+        choices=sorted(HYBRID_SCALE_MODES),
+        default="bf16_compat",
+        help="ConvRot scale-value policy for a hybrid generation.",
+    )
+    parser.add_argument(
+        "--round-hybrid-heads",
+        action="store_true",
+        help="Diagnostic: emulate the old BF16-rounded sampling-head values.",
+    )
+    args = parser.parse_args()
+    if args.original_weights and args.round_hybrid_heads:
+        parser.error("--round-hybrid-heads cannot be used with --original-weights")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
     model_dir = Path("models/Breeze-TTS-2")
     tokenizer, model, audio_tokenizer = load_runtime(
         model_dir,
         device="cuda:0",
         attn_implementation="eager",
-        weights_path=model_dir / "Breeze-TTS-2-int8-hybrid.safetensors",
+        weights_path=(
+            None
+            if args.original_weights
+            else model_dir / "Breeze-TTS-2-int8-hybrid.safetensors"
+        ),
+        hybrid_scale_mode=args.hybrid_scale_mode,
     )
+    if args.round_hybrid_heads:
+        model.lm_head.weight.data = model.lm_head.weight.data.to(torch.bfloat16).float()
+        model.depth_decoder.codebooks_head.weight.data = (
+            model.depth_decoder.codebooks_head.weight.data.to(torch.bfloat16).float()
+        )
     update_generation_config_for_breeze(model)
     runtime = FastBreezeStreamingRuntime(
         model,
@@ -112,6 +152,8 @@ def main() -> None:
     report = []
 
     for sample_index, (voice, instruction, segments) in enumerate(SAMPLES, start=1):
+        if args.voice is not None and voice != args.voice:
+            continue
         profile_id = profiles.resolve(voice)
         profile = profiles.get(profile_id)
         codes = profiles.load_codes(profile_id)
@@ -176,7 +218,7 @@ def main() -> None:
         finally:
             continuation.close(state)
         audio = np.concatenate(parts)
-        output = Path(f"continuation_sample_{sample_index:02d}_{voice}.wav")
+        output = args.output_dir / f"continuation_sample_{sample_index:02d}_{voice}.wav"
         _write_wav(output, audio, runtime.sample_rate)
         audio_seconds = audio.size / runtime.sample_rate
         wall_seconds = time.perf_counter() - started
@@ -187,6 +229,9 @@ def main() -> None:
                 "instruction": instruction,
                 "segments": len(segments),
                 "segment_gap_ms": SEGMENT_GAP_MS,
+                "original_weights": args.original_weights,
+                "hybrid_scale_mode": args.hybrid_scale_mode,
+                "round_hybrid_heads": args.round_hybrid_heads,
                 "audio_seconds": round(audio_seconds, 2),
                 "rtf": round(wall_seconds / audio_seconds, 4),
             }

@@ -21,6 +21,11 @@ models/Breeze-TTS-2/
 # Local editor/agent backups.
 *.bak
 
+# Local comparison checkout and macOS filesystem metadata.
+audio.cpp/
+.DS_Store
+._*
+
 .env
 .env.*
 !.env.example

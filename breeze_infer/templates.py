@@ -382,3 +382,28 @@ def prepare_continuation_text_inputs(
         model.device,
         [_tts_plain_segments(request)],
     )
+
+
+def prepare_continuation_cfg_text_inputs(
+    tokenizer: Any,
+    audio_tokenizer: Any,
+    model: Any,
+    text: str,
+    *,
+    instruction: str,
+    speaker: str = "S0",
+) -> tuple[dict[str, torch.Tensor | None], dict[str, torch.Tensor | None]]:
+    """Build matched conditional/unconditional continuation text branches.
+
+    Unlike the legacy continuation append, this refreshes Voice Direction's
+    instruction beside the new target text on the conditional branch while
+    retaining the normal plain target text on the unconditional branch.
+    """
+    if not instruction.strip():
+        raise ValueError("refreshed continuation CFG requires an instruction")
+    request = {"text": text, "instruction": instruction, "speaker": speaker}
+    kwargs = (tokenizer, audio_tokenizer, model.config, model.device)
+    return (
+        _prepare_segment_batches(*kwargs, [_tts_instruction_segments(request)]),
+        _prepare_segment_batches(*kwargs, [_tts_plain_segments(request)]),
+    )

@@ -13,6 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     BREEZE_MODEL_ROOT=/models \
     BREEZE_MODEL_DIR=/models/Breeze-TTS-2 \
     BREEZE_WEIGHTS_FILE=Breeze-TTS-2-int8-hybrid.safetensors \
+    BREEZE_HYBRID_SCALE_MODE=bf16_compat \
     BREEZE_PROFILE_DIR=/data/profiles
 
 # gcc/g++ are NOT for FlashAttention.

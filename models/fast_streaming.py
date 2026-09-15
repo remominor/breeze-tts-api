@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -755,6 +755,7 @@ class FastBreezeStreamingRuntime:
         request_id: str | None = None,
         seed: int | None = None,
         cancel_event: threading.Event | None = None,
+        frame_observer: Callable[[torch.Tensor], None] | None = None,
     ) -> Iterator[FastStreamingChunk]:
         """Yield audio chunks, stopping promptly when ``cancel_event`` is set.
 
@@ -885,6 +886,8 @@ class FastBreezeStreamingRuntime:
                 )
                 frame = torch.cat([token.view(1), depth_tokens[0]], dim=0)
                 if should_decode_codec_frame(frame, self.model.config):
+                    if frame_observer is not None:
+                        frame_observer(frame.detach())
                     chunk_buffer.append(frame.detach())
 
                 # A complete codec frame can be decoded immediately. Emit it

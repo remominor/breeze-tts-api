@@ -131,11 +131,20 @@ BREEZE_HOST_PORT=7860
 BREEZE_MODEL_DIR=/models/Breeze-TTS-2
 BREEZE_WEIGHTS_FILE=Breeze-TTS-2-int8-hybrid.safetensors
 BREEZE_WEIGHTS_PATH=/models/custom.safetensors  # custom: no auto-download
+BREEZE_HYBRID_SCALE_MODE=bf16_compat            # production hybrid policy
 BREEZE_PROFILE_DIR=/data/profiles
 NVIDIA_VISIBLE_DEVICES=0
 ```
 
 The model mount must be writable when automatic download is enabled.
+
+For the bundled ConvRot hybrid checkpoint, production explicitly pins
+`BREEZE_HYBRID_SCALE_MODE=bf16_compat`. It retains FP32 scale buffers required
+by the INT8 kernel while using BF16-rounded scale values for
+continuation-quality compatibility. Use `exact_fp32` only for controlled
+numerical evaluation; it can select different autoregressive audio trajectories
+without changing the hybrid VRAM footprint. See
+[`docs/hybrid-continuation-quality.md`](docs/hybrid-continuation-quality.md).
 
 ## API examples
 
@@ -153,10 +162,11 @@ curl -X POST http://127.0.0.1:7860/v1/audio/speech \
   }' --output voice-design.wav
 ```
 
-`guidance_scale=1` uses the conditional branch only. Values other than 1 use
-the guided conditional/unconditional path. The fast profile prewarms both
-shapes, so CFG 1 is not silently changed and does not fall back to eager
-backbone/depth execution.
+`guidance_scale=1` uses the conditional branch only. With a meaningful
+instruction, values other than 1 use the guided conditional/unconditional
+path. Instructions containing no alphabetic character are treated as empty;
+plain and clone requests always fall back to CFG 1 because those templates do
+not have an unconditional branch. The fast profile prewarms both shapes.
 
 ### Voice clone or direction
 
@@ -262,6 +272,18 @@ Include an unload/reload measurement with `--reload-before-first`. Benchmark
 JSON records the request, client timing, server timing, generated duration,
 RTF, process/GPU snapshot, and model lifecycle timing. Keep prompts, seed,
 fast flags, model checkpoint, GPU, and driver identical when comparing runs.
+
+Capture a seed sweep and compare identical codec codes through full, eager
+streaming, and CUDA-graph streaming decode paths:
+
+```bash
+python scripts/diagnose_startup_audio.py \
+  --label dtype-preserving-loader --seed-start 42 --seed-count 20
+```
+
+The diagnostic writes complete WAVs, first-200-ms clips, initial codec frames,
+and a JSON report below `outputs/startup-audio/<label>/`. Supply matching
+`--ref-audio` and `--ref-text` arguments to diagnose voice cloning.
 
 ## Profiles and endpoint summary
 
