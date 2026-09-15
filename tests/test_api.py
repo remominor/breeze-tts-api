@@ -30,6 +30,7 @@ from breeze_infer.api import (
     metrics,
     speech,
     unload_model,
+    voices,
 )
 from breeze_infer.api import (
     MAX_NEW_TOKENS as API_MAX_NEW_TOKENS,
@@ -262,6 +263,16 @@ def test_voice_item_uses_stable_profile_id_not_editable_name() -> None:
     assert item["id"] == "profile-123"
     assert item["voice_id"] == "profile-123"
     assert item["name"] == "Renamed Voice"
+
+
+def test_voices_returns_openai_and_llama_swap_compatible_lists(monkeypatch) -> None:
+    monkeypatch.setattr(app.state, "profiles", _MissingProfileStore(), raising=False)
+
+    response = voices()
+
+    assert response["object"] == "list"
+    assert response["data"] == response["voices"]
+    assert response["data"][0]["id"] == "voice-design"
 
 
 def test_cli_and_api_support_1500_generated_tokens() -> None:

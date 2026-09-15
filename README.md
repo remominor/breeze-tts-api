@@ -280,6 +280,10 @@ to save it without loading the model.
 | `GET /v1/audio/voices` | List built-in and saved voices |
 | `POST /v1/upload_voice` | Create a reusable voice profile |
 
+`GET /v1/audio/voices` returns the voice objects under both `data` (the
+OpenAI-style list field) and `voices` (for clients such as llama-swap's Speech
+UI). The two arrays contain identical entries.
+
 ## Fast inference switches
 
 The Docker entrypoint enables fast backbone decode, depth decoder, and codec

@@ -660,9 +660,11 @@ def voices() -> dict:
             "owned_by": "breezeblue",
         }
     ]
+    voice_list = builtins + [_voice_item(p) for p in app.state.profiles.list()]
     return {
         "object": "list",
-        "data": builtins + [_voice_item(p) for p in app.state.profiles.list()],
+        "data": voice_list,
+        "voices": voice_list,
     }
 
 
