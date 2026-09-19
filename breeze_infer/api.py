@@ -490,6 +490,14 @@ async def cors_middleware(request: Request, call_next):
 
 @app.get("/health")
 def health() -> JSONResponse:
+    cuda = cuda_snapshot()
+    cuda_health = {}
+    if cuda.get("initialized") and cuda.get("device_index") is not None:
+        cuda_health = {
+            "device": f"cuda:{cuda['device_index']}",
+            "vram_allocated_mb": round(cuda["allocated_mb"]),
+            "vram_reserved_mb": round(cuda["reserved_mb"]),
+        }
     if not _model_is_loaded(app):
         status = (
             "load_failed"
@@ -497,7 +505,13 @@ def health() -> JSONResponse:
             else "unloaded"
         )
         return JSONResponse(
-            {"status": status, "ready": False, "model_loaded": False}, status_code=503
+            {
+                "status": status,
+                "ready": False,
+                "model_loaded": False,
+                **cuda_health,
+            },
+            status_code=503,
         )
     runtime = app.state.runtime
     return JSONResponse(
@@ -512,10 +526,12 @@ def health() -> JSONResponse:
             "fast_enabled": runtime.fast_enabled,
             "profile_count": len(app.state.profiles.list()),
             "memory_rss_mb": round(psutil.Process().memory_info().rss / 1024 / 1024, 1),
+            **cuda_health,
         }
     )
 
 
+@app.post("/internal/model/load")
 @app.post("/v1/model/load")
 def load_model() -> dict:
     """Load Breeze onto the configured device, including enabled fast graphs."""
@@ -533,6 +549,7 @@ def load_model() -> dict:
     return {"status": "loaded", "model_loaded": True, "already_loaded": not loaded}
 
 
+@app.post("/internal/model/unload")
 @app.post("/v1/model/unload")
 def unload_model() -> dict:
     """Unload Breeze model resources from GPU memory."""

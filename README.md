@@ -94,7 +94,8 @@ Useful URLs:
 - `http://127.0.0.1:7860/metrics` — process/request metrics
 
 If the initial load fails, such as after a CUDA OOM, the API stays running in
-an unloaded `503` state. Free VRAM and retry `POST /v1/model/load`, or send a
+an unloaded `503` state. Free VRAM and retry `POST /v1/model/load` (or its
+`POST /internal/model/load` alias), or send a
 GPU-using request; a failed retry returns HTTP 500.
 
 ## Docker and Compose deployment
@@ -243,6 +244,9 @@ backbone KV, RNG progression, and codec state remain continuous.
 ```bash
 curl -X POST http://127.0.0.1:7860/v1/model/unload
 curl -X POST http://127.0.0.1:7860/v1/model/load
+# Equivalent internal endpoints:
+curl -X POST http://127.0.0.1:7860/internal/model/unload
+curl -X POST http://127.0.0.1:7860/internal/model/load
 ```
 
 Only GPU-using requests auto-load: speech synthesis and voice upload with
@@ -257,6 +261,11 @@ structured `process`, `cuda`, `model_lifecycle`, `inference`, and
 NVML is available, nvidia-smi-style memory attributed to this server process.
 Reading metrics while unloaded does not load the model or create a CUDA
 context.
+
+When CUDA has been initialized, `GET /health` also reports the active device
+and PyTorch allocator usage as `device`, `vram_allocated_mb`, and
+`vram_reserved_mb` (whole MiB). These fields are omitted before CUDA is
+initialized or when it is unavailable.
 
 Compare the prewarmed CFG paths against a running server:
 
@@ -299,6 +308,8 @@ to save it without loading the model.
 | `POST /v1/audio/speech/continuation` | Append a complete text chunk to retained generation state |
 | `POST /v1/model/load` | Load the model onto GPU |
 | `POST /v1/model/unload` | Release model and CUDA-graph memory |
+| `POST /internal/model/load` | Alias for `/v1/model/load` |
+| `POST /internal/model/unload` | Alias for `/v1/model/unload` |
 | `GET /v1/audio/voices` | List built-in and saved voices |
 | `POST /v1/upload_voice` | Create a reusable voice profile |
 

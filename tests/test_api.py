@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import threading
 import time
@@ -25,6 +26,7 @@ from breeze_infer.api import (
     _validate_speakable_text,
     _voice_item,
     app,
+    health,
     load_model,
     metrics,
     speech,
@@ -126,7 +128,82 @@ def test_api_exposes_only_health_and_streaming_speech() -> None:
     assert "/v1/audio/speech" in paths
     assert "/v1/model/load" in paths
     assert "/v1/model/unload" in paths
+    assert "/internal/model/load" in paths
+    assert "/internal/model/unload" in paths
     assert "/api/ref-audio-codes" not in paths
+
+
+def test_model_lifecycle_internal_routes_are_aliases() -> None:
+    routes = {route.path: route.endpoint for route in app.routes}
+
+    assert routes["/internal/model/load"] is routes["/v1/model/load"]
+    assert routes["/internal/model/unload"] is routes["/v1/model/unload"]
+
+
+def test_health_reports_initialized_cuda_allocator_usage(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    monkeypatch.setattr(
+        api_module,
+        "cuda_snapshot",
+        lambda: {
+            "available": True,
+            "initialized": True,
+            "device_index": 1,
+            "allocated_mb": 1842.4,
+            "reserved_mb": 2015.6,
+        },
+    )
+
+    payload = json.loads(health().body)
+
+    assert payload["device"] == "cuda:1"
+    assert payload["vram_allocated_mb"] == 1842
+    assert payload["vram_reserved_mb"] == 2016
+
+
+def test_health_omits_cuda_fields_before_cuda_initialization(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    monkeypatch.setattr(
+        api_module,
+        "cuda_snapshot",
+        lambda: {"available": True, "initialized": False},
+    )
+
+    payload = json.loads(health().body)
+
+    assert "device" not in payload
+    assert "vram_allocated_mb" not in payload
+    assert "vram_reserved_mb" not in payload
+
+
+def test_unloaded_health_still_reports_initialized_cuda_usage(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    app.state.runtime = None
+    monkeypatch.setattr(
+        api_module,
+        "cuda_snapshot",
+        lambda: {
+            "available": True,
+            "initialized": True,
+            "device_index": 1,
+            "allocated_mb": 1842.4,
+            "reserved_mb": 2015.6,
+        },
+    )
+
+    response = health()
+    payload = json.loads(response.body)
+
+    assert response.status_code == 503
+    assert payload["device"] == "cuda:1"
+    assert payload["vram_allocated_mb"] == 1842
+    assert payload["vram_reserved_mb"] == 2016
 
 
 def test_speech_accepts_a_request_object() -> None:
