@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 
 import numpy as np
@@ -23,6 +24,8 @@ from breeze_infer.api import (
     _profile_request,
     _prompt_token_count,
     _quiet_expected_torch_compile_warnings,
+    _release_cuda_memory,
+    _unload_app,
     _validate_speakable_text,
     _voice_item,
     app,
@@ -429,6 +432,52 @@ def test_model_load_and_unload_endpoints_manage_runtime(monkeypatch) -> None:
         "already_loaded": False,
     }
     assert load_model()["already_loaded"] is True
+
+
+def test_unload_drops_continuation_manager_before_cuda_cleanup(monkeypatch) -> None:
+    _configure_fake_speech_state(monkeypatch)
+
+    class _Manager:
+        def __init__(self, runtime) -> None:
+            self.runtime = runtime
+
+        def cleanup_idle(self) -> None:
+            pass
+
+    manager = _Manager(app.state.runtime)
+    manager_ref = weakref.ref(manager)
+    app.state.continuations = manager
+    del manager
+
+    def assert_manager_released() -> None:
+        assert manager_ref() is None
+
+    monkeypatch.setattr("breeze_infer.api._release_cuda_memory", assert_manager_released)
+
+    assert _unload_app(app) is True
+
+
+def test_cuda_release_clears_graph_compiler_and_cublas_caches(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    events = []
+    monkeypatch.setattr(
+        api_module, "clear_capture_resources", lambda: events.append("graphs")
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(torch.compiler, "reset", lambda: events.append("compiler"))
+    monkeypatch.setattr(
+        torch._C,
+        "_cuda_clearCublasWorkspaces",
+        lambda: events.append("cublas"),
+        raising=False,
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty"))
+
+    _release_cuda_memory()
+
+    assert events == ["sync", "graphs", "compiler", "cublas", "empty"]
 
 
 def test_unloaded_speech_lazily_loads_and_load_errors_are_http_500(monkeypatch) -> None:

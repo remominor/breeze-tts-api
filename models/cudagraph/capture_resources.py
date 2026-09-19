@@ -1,8 +1,9 @@
-"""Process-lifetime CUDA graph capture resources.
+"""CUDA graph capture resources shared while a model is loaded.
 
 CUDA graph allocations belong to a graph memory pool.  Reusing a pool and its
-capture stream for the same static graph shape lets a later model load reclaim
-that pool instead of growing device memory on each load/unload cycle.
+capture stream for the same static graph shape prevents duplicate captures
+within a loaded model.  The pools must be released when that model is unloaded
+so their VRAM can be returned to the CUDA allocator.
 """
 
 from __future__ import annotations
@@ -27,3 +28,12 @@ def get_capture_resources(
         )
         _RESOURCES[resource_key] = resources
     return resources
+
+
+def clear_capture_resources() -> None:
+    """Release CUDA graph pool handles and capture streams after model unload.
+
+    Call this only after all CUDA graph objects using these pools have been
+    discarded and their streams synchronized.
+    """
+    _RESOURCES.clear()

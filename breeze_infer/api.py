@@ -54,6 +54,7 @@ from models.continuation_streaming import (
     ContinuationContextError,
     ContinuationStreamingRuntime,
 )
+from models.cudagraph.capture_resources import clear_capture_resources
 from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
 from models.warmup_profile import load_warmup_profile
 
@@ -370,13 +371,30 @@ def _ensure_model_loaded(app: FastAPI) -> bool:
 
 
 def _release_cuda_memory() -> None:
-    """Best-effort collection of tensors left by an unsuccessful transition."""
+    """Best-effort release of model, CUDA graph, and compiler allocations."""
     gc.collect()
     try:
         import torch
 
-        if torch.cuda.is_available():
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
             torch.cuda.synchronize()
+        # Graph pool handles retain CUDA-graph allocations independently of
+        # runtime objects. Synchronize their streams before releasing them.
+        clear_capture_resources()
+        if cuda_available:
+            # Compiled modules are cached globally by torch. Resetting that
+            # cache releases references to the unloaded model and its graphs.
+            torch.compiler.reset()
+            # cuBLAS retains workspaces outside model ownership. Graph capture
+            # can make them tens of MiB, so release them before emptying the
+            # allocator cache as part of an explicit unload.
+            clear_cublas_workspaces = getattr(
+                torch._C, "_cuda_clearCublasWorkspaces", None
+            )
+            if clear_cublas_workspaces is not None:
+                clear_cublas_workspaces()
+            gc.collect()
             torch.cuda.empty_cache()
     except Exception:
         logger.warning(
@@ -401,6 +419,9 @@ def _unload_app(app: FastAPI) -> bool:
     app.state.audio_tokenizer = None
     app.state.continuations = None
     app.state.model_load_error = None
+    # ``manager`` owns a continuation runtime, which owns the model. Drop the
+    # local reference before collecting; clearing app.state alone is not enough.
+    manager = None
     _release_cuda_memory()
     app.state.metrics["model_unloads"] += 1
     observe(
