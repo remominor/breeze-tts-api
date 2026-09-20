@@ -403,6 +403,20 @@ def _release_cuda_memory() -> None:
         # runtime objects. Synchronize their streams before releasing them.
         clear_capture_resources()
         if cuda_available:
+            # ``torch.compiler.reset()`` only resets Dynamo's compilation
+            # cache.  It does not tear down Inductor's CUDA-graph trees, whose
+            # private pools are driver allocations and therefore invisible to
+            # ``torch.cuda.memory_allocated()``.  Explicitly shut them down
+            # before emptying the allocator cache so repeated load/unload
+            # cycles do not retain a graph pool per generation.
+            try:
+                from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+
+                reset_cudagraph_trees()
+            except (AttributeError, ImportError):
+                # This is an internal Inductor API; older supported Torch
+                # releases may not expose it.
+                pass
             # Compiled modules are cached globally by torch. Resetting that
             # cache releases references to the unloaded model and its graphs.
             torch.compiler.reset()

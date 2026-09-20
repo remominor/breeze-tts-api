@@ -536,6 +536,10 @@ def test_cuda_release_clears_graph_compiler_and_cublas_caches(monkeypatch) -> No
     )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(
+        "torch._inductor.cudagraph_trees.reset_cudagraph_trees",
+        lambda: events.append("inductor-graphs"),
+    )
     monkeypatch.setattr(torch.compiler, "reset", lambda: events.append("compiler"))
     monkeypatch.setattr(
         torch._C,
@@ -547,7 +551,14 @@ def test_cuda_release_clears_graph_compiler_and_cublas_caches(monkeypatch) -> No
 
     _release_cuda_memory()
 
-    assert events == ["sync", "graphs", "compiler", "cublas", "empty"]
+    assert events == [
+        "sync",
+        "graphs",
+        "inductor-graphs",
+        "compiler",
+        "cublas",
+        "empty",
+    ]
 
 
 def test_unloaded_speech_lazily_loads_and_load_errors_are_http_500(monkeypatch) -> None:
