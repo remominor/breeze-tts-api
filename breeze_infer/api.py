@@ -263,48 +263,68 @@ def _normalise_instruction_for_cfg(
 
 
 def _load_app(app: FastAPI, settings: ApiSettings) -> None:
-    _quiet_expected_torch_compile_warnings()
-    tokenizer, model, audio_tokenizer = load_runtime(
-        settings.model,
-        device=resolve_device(),
-        attn_implementation="eager",
-        weights_path=settings.weights,
-        hybrid_scale_mode=settings.hybrid_scale_mode,
-    )
-    update_generation_config_for_breeze(model)
-    runtime = FastBreezeStreamingRuntime(
-        model,
-        audio_tokenizer,
-        FastStreamingConfig(
-            max_new_tokens=MAX_NEW_TOKENS,
-            max_seq_len=MAX_SEQ_LEN,
-            fast_all=settings.fast_all,
-            fast_text_encoder=settings.fast_text_encoder,
-            fast_backbone_prefill=settings.fast_backbone_prefill,
-            fast_backbone_decode=settings.fast_backbone_decode,
-            fast_depth_decoder=settings.fast_depth_decoder,
-            fast_codec=settings.fast_codec,
-            repetition_penalty=REPETITION_PENALTY,
-        ),
-        tokenizer=tokenizer,
-    )
-    if runtime.fast_enabled:
-        profile = replace(
-            load_warmup_profile(FAST_CONFIG),
-            codec_chunk_frames=runtime.codec_chunk_frames,
+    """Load and publish a complete runtime, releasing partial loads on failure."""
+    tokenizer = model = audio_tokenizer = runtime = continuations = None
+    load_failure: str | None = None
+    try:
+        _quiet_expected_torch_compile_warnings()
+        tokenizer, model, audio_tokenizer = load_runtime(
+            settings.model,
+            device=resolve_device(),
+            attn_implementation="eager",
+            weights_path=settings.weights,
+            hybrid_scale_mode=settings.hybrid_scale_mode,
         )
-        runtime.warmup_from_profile(profile)
+        update_generation_config_for_breeze(model)
+        runtime = FastBreezeStreamingRuntime(
+            model,
+            audio_tokenizer,
+            FastStreamingConfig(
+                max_new_tokens=MAX_NEW_TOKENS,
+                max_seq_len=MAX_SEQ_LEN,
+                fast_all=settings.fast_all,
+                fast_text_encoder=settings.fast_text_encoder,
+                fast_backbone_prefill=settings.fast_backbone_prefill,
+                fast_backbone_decode=settings.fast_backbone_decode,
+                fast_depth_decoder=settings.fast_depth_decoder,
+                fast_codec=settings.fast_codec,
+                repetition_penalty=REPETITION_PENALTY,
+            ),
+            tokenizer=tokenizer,
+        )
+        if runtime.fast_enabled:
+            profile = replace(
+                load_warmup_profile(FAST_CONFIG),
+                codec_chunk_frames=runtime.codec_chunk_frames,
+            )
+            runtime.warmup_from_profile(profile)
+        continuations = ContinuationManager(
+            ContinuationStreamingRuntime(runtime, audio_eos=True),
+            ttl_seconds=settings.continuation_ttl_seconds,
+            mismatch_policy=settings.continuation_mismatch_policy,
+        )
+    except Exception as exc:  # noqa: BLE001 - cleanup must cover all load failures
+        # A failed warmup's traceback contains graph/runtime ``self`` values.
+        # Let this handler finish before cache cleanup so its exception frame
+        # cannot keep the partially loaded model alive through the next retry.
+        load_failure = str(exc)
+        # Do not log ``exc_info`` here: async/retaining log handlers can keep
+        # its traceback (and therefore the model) alive after this handler.
+        logger.error(
+            "Breeze runtime initialization failed; releasing partial load: %s",
+            load_failure,
+        )
+        tokenizer = model = audio_tokenizer = runtime = continuations = None
+    if load_failure is not None:
+        _release_cuda_memory()
+        raise RuntimeError(load_failure)
     (
         app.state.tokenizer,
         app.state.model,
         app.state.audio_tokenizer,
         app.state.runtime,
-    ) = tokenizer, model, audio_tokenizer, runtime
-    app.state.continuations = ContinuationManager(
-        ContinuationStreamingRuntime(runtime, audio_eos=True),
-        ttl_seconds=settings.continuation_ttl_seconds,
-        mismatch_policy=settings.continuation_mismatch_policy,
-    )
+        app.state.continuations,
+    ) = tokenizer, model, audio_tokenizer, runtime, continuations
 
 
 def _model_is_loaded(app: FastAPI) -> bool:

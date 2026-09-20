@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 import json
 import logging
@@ -17,6 +18,7 @@ from fastapi import HTTPException
 from breeze_infer.api import (
     DEFAULT_CFG_SCALE,
     _lifespan,
+    _load_app,
     _normalise_instruction_for_cfg,
     _parse_seed,
     _parse_stream,
@@ -432,6 +434,57 @@ def test_model_load_and_unload_endpoints_manage_runtime(monkeypatch) -> None:
         "already_loaded": False,
     }
     assert load_model()["already_loaded"] is True
+
+
+def test_failed_runtime_warmup_releases_partial_model_before_reraise(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    model_ref = None
+
+    class _Model:
+        pass
+
+    class _Runtime:
+        fast_enabled = True
+        codec_chunk_frames = 1
+
+        def __init__(self, model, *_args, **_kwargs) -> None:
+            self.model = model
+
+        def warmup_from_profile(self, _profile) -> None:
+            raise RuntimeError("warmup OOM")
+
+    def fake_load_runtime(*_args, **_kwargs):
+        nonlocal model_ref
+        model = _Model()
+        model_ref = weakref.ref(model)
+        return object(), model, object()
+
+    def assert_partial_model_is_released() -> None:
+        gc.collect()
+        assert model_ref is not None
+        assert model_ref() is None
+
+    settings = SimpleNamespace(
+        model=None,
+        weights=None,
+        hybrid_scale_mode="bf16_compat",
+        fast_all=None,
+        fast_text_encoder=False,
+        fast_backbone_prefill=False,
+        fast_backbone_decode=False,
+        fast_depth_decoder=False,
+        fast_codec=False,
+        continuation_ttl_seconds=30.0,
+        continuation_mismatch_policy="reject",
+    )
+    monkeypatch.setattr(api_module, "load_runtime", fake_load_runtime)
+    monkeypatch.setattr(api_module, "update_generation_config_for_breeze", lambda _: None)
+    monkeypatch.setattr(api_module, "FastBreezeStreamingRuntime", _Runtime)
+    monkeypatch.setattr(api_module, "_release_cuda_memory", assert_partial_model_is_released)
+
+    with pytest.raises(RuntimeError, match="warmup OOM"):
+        _load_app(app, settings)
 
 
 def test_unload_drops_continuation_manager_before_cuda_cleanup(monkeypatch) -> None:
