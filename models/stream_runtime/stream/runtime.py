@@ -583,6 +583,22 @@ class MultiRequestStreamRuntime:
     def close_request(self, req_id: str) -> None:
         self.release_request(req_id)
 
+    def close(self) -> None:
+        """Release static codec state and CUDA graph references on unload."""
+        self.req_to_lane.clear()
+        self._req_tombstones.clear()
+        self._single_lane_req_id = None
+        self.request_pool = None  # type: ignore[assignment]
+        for lane in [*self.lanes, *self.tail_eager_lanes]:
+            lane.cuda_graph = None
+            lane.cuda_graph_out = None
+            lane.step_model = None
+            lane.core = None
+            lane.binding = None
+        self.lanes.clear()
+        self.tail_eager_lanes.clear()
+        self.tokenizer = None  # type: ignore[assignment]
+
     def _select_lane(self, req_id: str) -> ExecutionLane:
         lane_idx = self.req_to_lane.get(req_id)
         if lane_idx is None:

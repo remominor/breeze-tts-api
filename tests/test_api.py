@@ -510,6 +510,23 @@ def test_unload_drops_continuation_manager_before_cuda_cleanup(monkeypatch) -> N
     assert _unload_app(app) is True
 
 
+def test_unload_closes_runtime_before_cuda_cleanup(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    events = []
+
+    class _Runtime:
+        def close(self) -> None:
+            events.append("runtime")
+
+    app.state.runtime = _Runtime()
+    monkeypatch.setattr(api_module, "_release_cuda_memory", lambda: events.append("cuda"))
+
+    assert _unload_app(app) is True
+    assert events == ["runtime", "cuda"]
+
+
 def test_cuda_release_clears_graph_compiler_and_cublas_caches(monkeypatch) -> None:
     import breeze_infer.api as api_module
 

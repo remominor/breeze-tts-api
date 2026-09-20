@@ -429,6 +429,7 @@ def _unload_app(app: FastAPI) -> bool:
 
     started = time.perf_counter()
     manager = getattr(app.state, "continuations", None)
+    runtime = getattr(app.state, "runtime", None)
     if manager is not None:
         manager.cleanup_idle()
     # Clear application references before collecting so compiled modules and
@@ -442,6 +443,14 @@ def _unload_app(app: FastAPI) -> bool:
     # ``manager`` owns a continuation runtime, which owns the model. Drop the
     # local reference before collecting; clearing app.state alone is not enough.
     manager = None
+    # The fast runtime owns CUDA graph objects and dynamically compiled module
+    # wrappers.  Drop those references before resetting compiler caches: graph
+    # pools alone do not release tensors still reachable through a runtime.
+    if runtime is not None:
+        close = getattr(runtime, "close", None)
+        if callable(close):
+            close()
+    runtime = None
     _release_cuda_memory()
     app.state.metrics["model_unloads"] += 1
     observe(

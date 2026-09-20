@@ -45,6 +45,12 @@ class TextEncoderGraphCache:
             (int(length) + self.token_granularity - 1) // self.token_granularity
         ) * self.token_granularity
 
+    def close(self) -> None:
+        """Release captured graph buffers during model teardown."""
+        with self._lock:
+            self._records.clear()
+            self.text_encoder = None  # type: ignore[assignment]
+
     @staticmethod
     def _smallest_fitting_key(
         keys: Sequence[tuple[int, int]], *, batch_size: int, token_length: int

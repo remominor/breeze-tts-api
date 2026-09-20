@@ -238,6 +238,23 @@ class DepthDecoderGraph:
             return batch_size
         return batch_size // 2
 
+    def close(self) -> None:
+        """Detach captured buffers and restore modules wrapped by torch.compile."""
+        self._bucket_graphs.clear()
+        for index, layer in enumerate(self.depth_model.layers):
+            original = getattr(layer, "_orig_mod", None)
+            if original is not None:
+                self.depth_model.layers[index] = original
+        original_norm = getattr(self.depth_model.norm, "_orig_mod", None)
+        if original_norm is not None:
+            self.depth_model.norm = original_norm
+        self.depth_model = None
+        self.codebooks_head = None
+        self._orig_codebooks_head = None
+        self.embed_tokens = None
+        self.inputs_embeds_projector = None
+        self.backbone_hidden_state_projector = None
+
     # ------------------------------------------------------------------
     # Runtime setters — no recapture needed
     # ------------------------------------------------------------------

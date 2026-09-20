@@ -207,6 +207,51 @@ class FastBreezeStreamingRuntime:
     def sample_rate(self) -> int:
         return int(self.model.config.codec_config.sampling_rate)
 
+    def close(self) -> None:
+        """Break CUDA graph and compiler references before an explicit unload.
+
+        Merely dropping the FastBreezeStreamingRuntime is insufficient when a
+        CUDA graph or ``torch.compile`` wrapper retains one of its static
+        buffers.  This method is only for the service lifecycle path; a closed
+        runtime must not be reused.
+        """
+        codec = self._codec_runtime
+        if codec is not None:
+            close = getattr(codec, "close", None)
+            if callable(close):
+                close()
+        self._codec_runtime = None
+
+        text_cache = getattr(self.model, "_fast_text_encoder_graph_cache", None)
+        if text_cache is not None:
+            close = getattr(text_cache, "close", None)
+            if callable(close):
+                close()
+            delattr(self.model, "_fast_text_encoder_graph_cache")
+
+        for graph in self._backbone_graphs.values():
+            graph.reset()
+            graph.graph = None
+        self._backbone_graphs.clear()
+        self._backbone_graph = None
+        for cache in self._backbone_prefill_graphs.values():
+            cache._records.clear()
+        self._backbone_prefill_graphs.clear()
+        self._backbone_prefill_graph = None
+
+        depth_graph = self._depth_decoder_graph
+        if depth_graph is not None:
+            close = getattr(depth_graph, "close", None)
+            if callable(close):
+                close()
+        self._depth_decoder_graph = None
+        self._warmup_profile = None
+        self._warmup_manifest = None
+        self._frozen_branch_batch_sizes = None
+        self.model = None  # type: ignore[assignment]
+        self.audio_tokenizer = None
+        self.tokenizer = None
+
     def _sampling_params(self, generation_config: Any) -> dict[str, Any]:
         def _value(name: str, override: Any, default: Any) -> Any:
             if override is not None:
