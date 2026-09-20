@@ -417,11 +417,19 @@ def test_model_load_and_unload_endpoints_manage_runtime(monkeypatch) -> None:
     import breeze_infer.api as api_module
 
     _configure_fake_speech_state(monkeypatch)
-    assert unload_model() == {
+    reexecs = []
+    monkeypatch.setattr(
+        api_module, "_reexec_unloaded_process", lambda: reexecs.append(True)
+    )
+    response = unload_model()
+    assert json.loads(response.body) == {
         "status": "unloaded",
         "model_loaded": False,
         "was_loaded": True,
     }
+    assert response.background is not None
+    asyncio.run(response.background())
+    assert reexecs == [True]
     assert app.state.runtime is None
 
     def fake_load(target_app, _settings):
@@ -434,6 +442,51 @@ def test_model_load_and_unload_endpoints_manage_runtime(monkeypatch) -> None:
         "already_loaded": False,
     }
     assert load_model()["already_loaded"] is True
+
+
+def test_repeated_unload_does_not_restart_idle_process(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    _configure_fake_speech_state(monkeypatch)
+    monkeypatch.setattr(api_module, "_release_cuda_memory", lambda: None)
+    first = unload_model()
+    second = unload_model()
+
+    assert first.background is not None
+    assert json.loads(second.body) == {
+        "status": "unloaded",
+        "model_loaded": False,
+        "was_loaded": False,
+    }
+    assert second.background is None
+
+
+def test_unload_reexec_preserves_cli_and_requests_unloaded_start(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    called = {}
+    monkeypatch.setattr(api_module.sys, "argv", ["api.py", "model", "--port", "9000"])
+    monkeypatch.setattr(api_module.sys, "executable", "/venv/bin/python")
+    monkeypatch.setattr(
+        api_module.os,
+        "execve",
+        lambda executable, argv, environment: called.update(
+            executable=executable, argv=argv, environment=environment
+        ),
+    )
+
+    api_module._reexec_unloaded_process()
+
+    assert called["executable"] == "/venv/bin/python"
+    assert called["argv"] == [
+        "/venv/bin/python",
+        "-m",
+        "breeze_infer.api",
+        "model",
+        "--port",
+        "9000",
+    ]
+    assert called["environment"][api_module._START_UNLOADED_ENV] == "1"
 
 
 def test_failed_runtime_warmup_releases_partial_model_before_reraise(monkeypatch) -> None:
@@ -528,12 +581,7 @@ def test_unload_closes_runtime_before_cuda_cleanup(monkeypatch) -> None:
 
 
 def test_cuda_release_clears_graph_compiler_and_cublas_caches(monkeypatch) -> None:
-    import breeze_infer.api as api_module
-
     events = []
-    monkeypatch.setattr(
-        api_module, "clear_capture_resources", lambda: events.append("graphs")
-    )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
     monkeypatch.setattr(
@@ -553,7 +601,6 @@ def test_cuda_release_clears_graph_compiler_and_cublas_caches(monkeypatch) -> No
 
     assert events == [
         "sync",
-        "graphs",
         "inductor-graphs",
         "compiler",
         "cublas",
@@ -562,10 +609,7 @@ def test_cuda_release_clears_graph_compiler_and_cublas_caches(monkeypatch) -> No
 
 
 def test_cuda_release_continues_when_inductor_graph_reset_fails(monkeypatch) -> None:
-    import breeze_infer.api as api_module
-
     events = []
-    monkeypatch.setattr(api_module, "clear_capture_resources", lambda: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(
@@ -667,6 +711,26 @@ def test_startup_load_failure_keeps_server_idle_for_later_retry(
             assert app.state.model_load_error == "CUDA out of memory"
 
     asyncio.run(start_server())
+
+
+def test_reexec_start_skips_automatic_model_load(monkeypatch, tmp_path) -> None:
+    import breeze_infer.api as api_module
+
+    settings = SimpleNamespace(voice_dir=tmp_path, continuation_ttl_seconds=30.0)
+    load_calls = []
+    monkeypatch.setattr(api_module, "_settings", settings)
+    monkeypatch.setenv(api_module._START_UNLOADED_ENV, "1")
+    monkeypatch.setattr(
+        api_module, "_ensure_model_loaded", lambda *_args: load_calls.append(True)
+    )
+
+    async def start_server() -> None:
+        async with _lifespan(app):
+            assert app.state.runtime is None
+            assert api_module._START_UNLOADED_ENV not in api_module.os.environ
+
+    asyncio.run(start_server())
+    assert load_calls == []
 
 
 def test_abandoned_stream_background_releases_inference_lock(monkeypatch) -> None:

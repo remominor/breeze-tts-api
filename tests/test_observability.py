@@ -8,7 +8,6 @@ from breeze_infer.observability import (
     _nvml_process_memory,
     cuda_snapshot,
 )
-from models.cudagraph import capture_resources
 
 
 def test_running_stats_use_constant_size_aggregates() -> None:
@@ -74,12 +73,3 @@ def test_nvml_is_shutdown_after_snapshot(monkeypatch) -> None:
 
     assert snapshot["nvml_available"] is True
     assert calls == ["init", "shutdown"]
-
-
-def test_clear_capture_resources_drops_graph_pool_handles(monkeypatch) -> None:
-    resources = {("codec", "cuda:0", 1): (object(), object())}
-    monkeypatch.setattr(capture_resources, "_RESOURCES", resources)
-
-    capture_resources.clear_capture_resources()
-
-    assert resources == {}

@@ -8,6 +8,8 @@ import base64
 import gc
 import json
 import logging
+import os
+import sys
 import tempfile
 import threading
 import time
@@ -54,7 +56,6 @@ from models.continuation_streaming import (
     ContinuationContextError,
     ContinuationStreamingRuntime,
 )
-from models.cudagraph.capture_resources import clear_capture_resources
 from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
 from models.warmup_profile import load_warmup_profile
 
@@ -66,6 +67,7 @@ MAX_SEQ_LEN = 2048
 REPETITION_PENALTY = 1.1
 CONTEXT_SAFETY_FRAMES = 64
 logger = logging.getLogger(__name__)
+_START_UNLOADED_ENV = "BREEZE_START_UNLOADED_ONCE"
 
 
 @dataclass(frozen=True)
@@ -399,9 +401,6 @@ def _release_cuda_memory() -> None:
         cuda_available = torch.cuda.is_available()
         if cuda_available:
             torch.cuda.synchronize()
-        # Graph pool handles retain CUDA-graph allocations independently of
-        # runtime objects. Synchronize their streams before releasing them.
-        clear_capture_resources()
         if cuda_available:
             # ``torch.compiler.reset()`` only resets Dynamo's compilation
             # cache.  It does not tear down Inductor's CUDA-graph trees, whose
@@ -476,6 +475,20 @@ def _unload_app(app: FastAPI) -> bool:
     return True
 
 
+def _reexec_unloaded_process() -> None:
+    """Replace this process so CUDA driver state is released completely."""
+    environment = os.environ.copy()
+    environment[_START_UNLOADED_ENV] = "1"
+    argv = [sys.executable, "-m", "breeze_infer.api", *sys.argv[1:]]
+    os.execve(sys.executable, argv, environment)
+
+
+async def _reexec_unloaded_after_response() -> None:
+    """Re-exec only after Starlette has finished sending the unload response."""
+    await asyncio.sleep(0)
+    _reexec_unloaded_process()
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     if _settings is None:
@@ -490,12 +503,14 @@ async def _lifespan(app: FastAPI):
     app.state.continuations = None
     app.state.model_load_error = None
     app.state.start_time = time.monotonic()
-    try:
-        _ensure_model_loaded(app)
-    except Exception:
-        # Keep the HTTP service alive after e.g. a transient CUDA OOM. The
-        # explicit load endpoint and GPU-using requests can retry later.
-        logger.exception("Breeze model was not loaded at startup; server is idle")
+    start_unloaded = os.environ.pop(_START_UNLOADED_ENV, None) == "1"
+    if not start_unloaded:
+        try:
+            _ensure_model_loaded(app)
+        except Exception:
+            # Keep the HTTP service alive after e.g. a transient CUDA OOM. The
+            # explicit load endpoint and GPU-using requests can retry later.
+            logger.exception("Breeze model was not loaded at startup; server is idle")
     async def expire_continuations() -> None:
         while True:
             await asyncio.sleep(min(1.0, _settings.continuation_ttl_seconds))
@@ -616,8 +631,8 @@ def load_model() -> dict:
 
 @app.post("/internal/model/unload")
 @app.post("/v1/model/unload")
-def unload_model() -> dict:
-    """Unload Breeze model resources from GPU memory."""
+def unload_model() -> JSONResponse:
+    """Unload Breeze and restart idle so the CUDA context is destroyed."""
     if not _request_lock.acquire(blocking=False):
         raise HTTPException(
             409, "An inference request or model transition is already running."
@@ -626,7 +641,12 @@ def unload_model() -> dict:
         unloaded = _unload_app(app)
     finally:
         _request_lock.release()
-    return {"status": "unloaded", "model_loaded": False, "was_loaded": unloaded}
+    return JSONResponse(
+        {"status": "unloaded", "model_loaded": False, "was_loaded": unloaded},
+        background=(
+            BackgroundTask(_reexec_unloaded_after_response) if unloaded else None
+        ),
+    )
 
 
 @app.get("/metrics")

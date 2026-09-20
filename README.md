@@ -25,7 +25,7 @@ paths, and explicit GPU model load/unload controls.
   [`drbaph/Breeze-TTS-2-comfyui`](https://huggingface.co/drbaph/Breeze-TTS-2-comfyui).
 - 24 kHz mono PCM streaming or SSE audio chunks.
 - Persistent profiles and cached reference audio codes.
-- Explicit GPU model lifecycle: load and unload without restarting the API.
+- Explicit GPU model lifecycle: load on demand and fully release VRAM on unload.
 - Swagger UI at `http://HOST:7860/docs`.
 
 ## Requirements
@@ -251,7 +251,23 @@ curl -X POST http://127.0.0.1:7860/internal/model/load
 
 Only GPU-using requests auto-load: speech synthesis and voice upload with
 `preload=true`. Health, metrics, model metadata, and voice/profile CRUD remain
-available while unloaded.
+available while unloaded. A successful unload briefly restarts the API process
+after sending its response. This process boundary releases the CUDA context and
+driver-owned VRAM that PyTorch cannot return from a live process; service
+metrics and uptime restart with it. A repeated unload while already unloaded
+does not restart the process.
+
+Run the host-visible VRAM regression check on a GPU machine with production
+flags after lifecycle changes:
+
+```bash
+uv run python scripts/test_model_lifecycle_gpu.py \
+  models/Breeze-TTS-2 \
+  --weights models/Breeze-TTS-2/Breeze-TTS-2-int8-hybrid.safetensors \
+  --cycles 3 -- \
+  --hybrid-scale-mode bf16_compat \
+  --fast-backbone-decode --fast-depth-decoder --fast-codec
+```
 
 ### Metrics and benchmarking
 
