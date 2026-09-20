@@ -561,6 +561,31 @@ def test_cuda_release_clears_graph_compiler_and_cublas_caches(monkeypatch) -> No
     ]
 
 
+def test_cuda_release_continues_when_inductor_graph_reset_fails(monkeypatch) -> None:
+    import breeze_infer.api as api_module
+
+    events = []
+    monkeypatch.setattr(api_module, "clear_capture_resources", lambda: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        "torch._inductor.cudagraph_trees.reset_cudagraph_trees",
+        lambda: (_ for _ in ()).throw(RuntimeError("tree shutdown failed")),
+    )
+    monkeypatch.setattr(torch.compiler, "reset", lambda: events.append("compiler"))
+    monkeypatch.setattr(
+        torch._C,
+        "_cuda_clearCublasWorkspaces",
+        lambda: events.append("cublas"),
+        raising=False,
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty"))
+
+    _release_cuda_memory()
+
+    assert events == ["compiler", "cublas", "empty"]
+
+
 def test_unloaded_speech_lazily_loads_and_load_errors_are_http_500(monkeypatch) -> None:
     import breeze_infer.api as api_module
 

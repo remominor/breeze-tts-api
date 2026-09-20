@@ -413,10 +413,11 @@ def _release_cuda_memory() -> None:
                 from torch._inductor.cudagraph_trees import reset_cudagraph_trees
 
                 reset_cudagraph_trees()
-            except (AttributeError, ImportError):
-                # This is an internal Inductor API; older supported Torch
-                # releases may not expose it.
-                pass
+            except Exception as exc:  # noqa: BLE001 - optional internal cleanup
+                # This internal API can fail while releasing a graph tree. It
+                # must never stop the mandatory compiler/allocator cleanup
+                # below, or every subsequent model load retains the old pool.
+                logger.warning("Inductor CUDA graph-tree cleanup failed: %s", exc)
             # Compiled modules are cached globally by torch. Resetting that
             # cache releases references to the unloaded model and its graphs.
             torch.compiler.reset()
